@@ -1,0 +1,3 @@
+# Ignore Google Cloud credentials
+backend/google-credentials.json
+backend/.env
