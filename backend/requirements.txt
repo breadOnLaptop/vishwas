@@ -1,0 +1,11 @@
+# Web Framework & Server
+fastapi
+uvicorn[standard]
+
+# Google Cloud AI Services
+google-cloud-aiplatform
+google-cloud-vision
+google-cloud-language
+
+# For loading environment variables (.env file)
+python-dotenv
