@@ -1,3 +1,13 @@
+# virtual env
+backend/.venv
+
+# caches
+.mypy_cache
+
 # Ignore Google Cloud credentials
 backend/google-credentials.json
 backend/.env
+
+# frontend
+frontend/node_modules/
+frontend/package-lock.json
