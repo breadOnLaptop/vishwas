@@ -9,3 +9,10 @@ google-cloud-language
 
 # For loading environment variables (.env file)
 python-dotenv
+
+pydantic
+python-multipart
+pydantic-settings
+google-genai
+httpx
+watchfiles
