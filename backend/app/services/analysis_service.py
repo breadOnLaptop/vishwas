@@ -9,10 +9,13 @@ def compute_misinfo_score(
     llm_debug: dict | None = None,
 ) -> Dict[str, Any]:
     """
-    Convert signals into a 0..10 misinfo score (higher => more likely misinformation).
-    text_signal: 0..1 where 0 = misinformation, 1 = truthful/safe
-    image_safe_search: 0..1 where 0 = unsafe, 1 = safe.
-        If None -> no image was provided -> treat as fully safe (1.0).
+    Convert signals into a 0..10 score where HIGHER => more likely TRUTHFUL / SAFE (good).
+    Internally we compute misinfo_likelihood (0..1 where higher => more likely misinformation),
+    then invert it to produce a truth/confidence score.
+    
+    Inputs:
+      - text_signal: 0..1 where 0 = misinformation, 1 = truthful/safe
+      - image_safe_search: 0..1 where 0 = unsafe, 1 = safe. If None -> no image -> treat as fully safe (1.0).
     """
     if image_labels is None:
         image_labels = []
@@ -37,9 +40,11 @@ def compute_misinfo_score(
     misinfo_likelihood = (w_text * misinfo_from_text) + (w_image * misinfo_from_image)
     misinfo_likelihood = max(0.0, min(1.0, misinfo_likelihood))
 
-    score_0_10 = round(misinfo_likelihood * 10.0, 2)
+    # NEW: truth_confidence = 1 - misinfo_likelihood (0..1 where higher => more truthful)
+    truth_confidence = 1.0 - misinfo_likelihood
+    score_0_10 = round(truth_confidence * 10.0, 2)
 
-    # color mapping uses original text_signal (0..1 where low = misinformation)
+    # color mapping uses original text_signal (0..1 where low = misinformation, high = truthful)
     color = map_confidence_to_color(float(text_signal))
 
     # top reasons assembly (improved ordering)
