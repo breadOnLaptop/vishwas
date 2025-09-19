@@ -12,3 +12,6 @@ httpx
 watchfiles
 google-api-python-client
 httpx
+PyPDF2
+python-docx
+PyYAML
