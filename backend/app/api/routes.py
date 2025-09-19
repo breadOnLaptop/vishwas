@@ -77,26 +77,27 @@ async def analyze_text(text: str = Form(...), source_url: Optional[str] = Form(N
     }
     return JSONResponse(content=result)
 
-
 class ReportRequest(BaseModel):
     detected_content: str
     misinformation_score: float
     detected_source: str
 
-
 @router.post("/report")
 def report_misinformation(request: ReportRequest):
-    threshold = 7.5
-    if request.misinformation_score >= threshold:
+    # Previously threshold was 7.5 (when higher=more likely misinformation).
+    # After flipping the 0..10 scale so HIGHER = more truthful, we report when score is LOW.
+    threshold = 2.5  # equivalent to previous 7.5 in the old scale
+
+    if request.misinformation_score <= threshold:
         subject = "🚨 Misinformation Alert - Vishwas Prototype"
         body = (
             f"🚩 Potential Misinformation Detected\n\n"
             f"Content: {request.detected_content}\n"
-            f"Score (0-10): {request.misinformation_score}\n"
+            f"Score (0-10, higher=more truthful): {request.misinformation_score}\n"
             f"Source: {request.detected_source}\n\n"
             f"Review this content carefully."
         )
-        authority_email = "peeyushmaurya.dev@gmail.com"  # Replace
+        authority_email = "peeyushmaurya.dev@gmail.com"  # Replace with real authority
         send_misinformation_report(subject, body, authority_email)
         return {"status": "Report sent successfully", "score": request.misinformation_score}
     else:
