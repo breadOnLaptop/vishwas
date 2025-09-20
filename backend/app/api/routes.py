@@ -1,30 +1,39 @@
-# app/api/routes.py
-import io
+import json
+import logging
+from io import BytesIO
+from typing import Optional, Any
+
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
-from typing import Optional
-
 from pydantic import BaseModel
+
 from app.schemas.analysis_schema import AnalysisResponse
 from app.services.google_ai_service import (
     analyze_image_bytes,
     analyze_content,
+    report_if_severe,
     send_misinformation_report,
 )
 from app.services.analysis_service import compute_misinfo_score
+from app.core.config import settings
 
-# For document parsing
-from io import BytesIO
+# For document parsing: declare these as Optional[Any] to satisfy type checkers when import fails
+PdfReader: Optional[Any] = None
+docx: Optional[Any] = None
+
 try:
-    from PyPDF2 import PdfReader
+    from PyPDF2 import PdfReader as _PdfReader  # type: ignore
+    PdfReader = _PdfReader
 except Exception:
     PdfReader = None
 
 try:
-    import docx  # python-docx
+    import docx as _docx  # python-docx
+    docx = _docx
 except Exception:
     docx = None
 
+logger = logging.getLogger("routes")
 router = APIRouter()
 
 
@@ -41,12 +50,12 @@ async def analyze_image(file: UploadFile = File(...), source_url: Optional[str] 
 
     misp_confidence = float(unified.get("misp_confidence", 0.5))
     explanation = unified.get("explanation", "")
+    user_explanation = unified.get("user_explanation", "")
     parsed = unified.get("parsed", None)
     sources = unified.get("sources", [])            # per-claim sources
     top_sources = unified.get("top_sources", [])    # flat clickable links
     debug = unified.get("debug", {})
 
-    # Use None for image_safe_search when vision didn't provide a score
     image_safe_search_score = vision_result.get("safe_search_score") if vision_result.get("safe_search_score") is not None else None
 
     score_obj = compute_misinfo_score(
@@ -62,12 +71,20 @@ async def analyze_image(file: UploadFile = File(...), source_url: Optional[str] 
         "color": score_obj["color"],
         "top_reasons": score_obj["top_reasons"],
         "explanation": explanation,
+        "user_explanation": user_explanation,
         "vision": vision_result,
         "parsed": parsed,
         "sources": sources,
         "top_sources": top_sources,
-        "debug": debug,   # remove in production if not desired
+        "debug": debug,
     }
+
+    # Centralized reporting: call report_if_severe with the unified analysis (misp_confidence 0..1)
+    try:
+        report_if_severe(unified, report_to_email=getattr(settings, "REPORT_TO_EMAIL", None))
+    except Exception as e:
+        logger.warning(f"report_if_severe failed: {e}")
+
     return JSONResponse(content=result)
 
 
@@ -80,6 +97,7 @@ async def analyze_text(text: str = Form(...), source_url: Optional[str] = Form(N
 
     misp_confidence = float(unified.get("misp_confidence", 0.5))
     explanation = unified.get("explanation", "")
+    user_explanation = unified.get("user_explanation", "")
     parsed = unified.get("parsed", None)
     sources = unified.get("sources", [])
     top_sources = unified.get("top_sources", [])
@@ -98,12 +116,19 @@ async def analyze_text(text: str = Form(...), source_url: Optional[str] = Form(N
         "color": score_obj["color"],
         "top_reasons": score_obj["top_reasons"],
         "explanation": explanation,
+        "user_explanation": user_explanation,
         "vision": None,
         "parsed": parsed,
         "sources": sources,
         "top_sources": top_sources,
         "debug": debug,
     }
+
+    try:
+        report_if_severe(unified, report_to_email=getattr(settings, "REPORT_TO_EMAIL", None))
+    except Exception as e:
+        logger.warning(f"report_if_severe failed: {e}")
+
     return JSONResponse(content=result)
 
 
@@ -126,7 +151,7 @@ def report_misinformation(request: ReportRequest):
             f"Source: {request.detected_source}\n\n"
             f"Review this content carefully."
         )
-        authority_email = "peeyushmaurya.dev@gmail.com"  # Replace
+        authority_email = getattr(settings, "REPORT_TO_EMAIL", None) or "peeyushmaurya.dev@gmail.com"
         send_misinformation_report(subject, body, authority_email)
         return {"status": "Report sent successfully", "score": request.misinformation_score}
     else:
@@ -137,8 +162,6 @@ def report_misinformation(request: ReportRequest):
 async def analyze_document(file: UploadFile = File(...), source_url: Optional[str] = Form(None)):
     """
     Accepts PDFs, DOCX and plain text files. Extracts text and runs the same analyze_content flow.
-    Note: this endpoint currently extracts text only. If you need OCR of embedded images in PDFs,
-    use pdf2image + analyze_image_bytes, or use Google Vision Document/Batch API for PDF OCR.
     """
     content = await file.read()
     if not content:
@@ -156,7 +179,6 @@ async def analyze_document(file: UploadFile = File(...), source_url: Optional[st
                 try:
                     pages.append(p.extract_text() or "")
                 except Exception:
-                    # ignore page extraction errors, continue
                     pages.append("")
             extracted_text = "\n".join(pages).strip()
         except Exception as e:
@@ -165,34 +187,31 @@ async def analyze_document(file: UploadFile = File(...), source_url: Optional[st
     # DOCX
     elif filename.endswith(".docx") and docx is not None:
         try:
-            doc = docx.Document(BytesIO(content))
+            # python-docx expects a file-like object
+            from docx import Document  # type: ignore
+            doc = Document(BytesIO(content))
             paragraphs = [p.text for p in doc.paragraphs if p.text]
             extracted_text = "\n".join(paragraphs).strip()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"DOCX text extraction failed: {e}")
 
     else:
-        # Try to decode as UTF-8 / fallback to latin-1 plain text
+        # Try to decode as text
         try:
             extracted_text = content.decode("utf-8").strip()
         except Exception:
             try:
                 extracted_text = content.decode("latin-1").strip()
             except Exception:
-                # Unknown binary file: attempt to run OCR via Vision (document bytes as image)
-                # This is best-effort — if it's an image file (e.g., scanned PDF converted to single image),
-                # analyze_image_bytes will run Vision OCR.
+                # Unknown binary file: attempt to run OCR via Vision
                 vision_result = analyze_image_bytes(content)
                 extracted_text = vision_result.get("text", "") or ""
-
-    if not extracted_text:
-        # If no text extracted, still run analyze_content (fallback will try to create claims from context)
-        extracted_text = ""
 
     unified = analyze_content(text=extracted_text, image_bytes=None, source_url=source_url)
 
     misp_confidence = float(unified.get("misp_confidence", 0.5))
     explanation = unified.get("explanation", "")
+    user_explanation = unified.get("user_explanation", "")
     parsed = unified.get("parsed", None)
     sources = unified.get("sources", [])
     top_sources = unified.get("top_sources", [])
@@ -211,10 +230,17 @@ async def analyze_document(file: UploadFile = File(...), source_url: Optional[st
         "color": score_obj["color"],
         "top_reasons": score_obj["top_reasons"],
         "explanation": explanation,
+        "user_explanation": user_explanation,
         "vision": None,
         "parsed": parsed,
         "sources": sources,
         "top_sources": top_sources,
         "debug": debug,
     }
+
+    try:
+        report_if_severe(unified, report_to_email=getattr(settings, "REPORT_TO_EMAIL", None))
+    except Exception as e:
+        logger.warning(f"report_if_severe failed: {e}")
+
     return JSONResponse(content=result)

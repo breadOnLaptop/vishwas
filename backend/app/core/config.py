@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     SMTP_USER: str | None = None
     SMTP_PASS: str | None = None
 
+    # Where automated reports should be sent (optional)
+    REPORT_TO_EMAIL: str | None = None
+
     class Config:
         env_file = str(ENV_PATH)
         env_file_encoding = "utf-8"

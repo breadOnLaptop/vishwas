@@ -1,4 +1,3 @@
-# app/schemas/analysis_schema.py
 from typing import Any, List, Optional, Dict
 from pydantic import BaseModel
 
@@ -29,8 +28,9 @@ class AnalysisResponse(BaseModel):
     color: str
     top_reasons: List[str]
     explanation: str
+    user_explanation: str
     vision: Optional[VisionResult] = None
-    parsed: Optional[Dict[str, Any]] = None  # leave as free-form, contains 'claims' list
+    parsed: Optional[Dict[str, Any]] = None  # free-form parsed claims object
     sources: Optional[List[Dict[str, Any]]] = []  # per-claim sources
     top_sources: Optional[List[Dict[str, Any]]] = []  # flat list of title/link/snippet
     debug: Optional[Dict[str, Any]] = None
@@ -42,6 +42,7 @@ class AnalysisResponse(BaseModel):
                 "color": "green",
                 "top_reasons": ["LLM estimate indicates safe", "No suspicious image signals"],
                 "explanation": "{...}",
+                "user_explanation": "Summary: ...",
                 "vision": {"text": "", "labels": [], "safe_search": {}, "safe_search_score": None, "raw": {}},
                 "parsed": {"claims": []},
                 "sources": [],
