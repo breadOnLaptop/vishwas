@@ -1,5 +1,5 @@
+# analysis_service.py
 from typing import Dict, Any, Optional, List
-from app.services.google_ai_service import map_confidence_to_color
 
 def compute_misinfo_score(
     text_signal: float,
@@ -22,13 +22,7 @@ def compute_misinfo_score(
             "color": str (e.g. "red","amber","green"),
             "top_reasons": List[str]
         }
-
-    NOTE: This function only aggregates numeric signals into an interpretable score.
-    The truthiness/text_signal should come from google_ai_service.verify_claim_pipeline
-    (which itself prefers Fact Check API then Vertex).
     """
-
-    # clamp helpers
     def clamp01(x: Optional[float]) -> float:
         try:
             if x is None:
@@ -40,20 +34,25 @@ def compute_misinfo_score(
     text_val = clamp01(text_signal)
     image_safe_val = clamp01(image_safe_search)
 
-    # Primary aggregation rule:
-    # - prefer text_val as main signal (70%)
-    # - image safety contributes 30% but only when present
     weight_text = 0.7
     weight_image = 0.3 if image_safe_search is not None else 0.0
 
     combined = text_val * weight_text + image_safe_val * weight_image
-    # Normalize to 0..10 scale
     score_0_10 = round(combined * 10.0, 2)
 
-    # map to color using helper from google_ai_service
-    color = map_confidence_to_color(combined)
+    # import here to avoid circular import at module load
+    try:
+        from app.services.google_ai_service import map_confidence_to_color
+        color = map_confidence_to_color(combined)
+    except Exception:
+        # fallback mapping
+        if combined <= 0.3:
+            color = "red"
+        elif combined <= 0.6:
+            color = "orange"
+        else:
+            color = "green"
 
-    # create human-friendly reasons (kept short)
     reasons: List[str] = []
     if text_val <= 0.25:
         reasons.append(f"Text analysis strongly contradicts the claim (truthiness={text_val:.2f}).")
@@ -70,11 +69,9 @@ def compute_misinfo_score(
         else:
             reasons.append(f"Image analysis does not raise obvious safety issues (safety={image_safe_val:.2f}).")
 
-    # Include small debug hint if available
     if llm_debug:
         reasons.append("LLM debug: see llm_debug for details.")
 
-    # If nothing above, provide a default statement
     if not reasons:
         reasons.append("No strong signals for misinformation detected; content appears credible.")
 
