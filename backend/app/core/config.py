@@ -1,36 +1,57 @@
 import os
 from pathlib import Path
 from pydantic_settings import BaseSettings
-from dotenv import load_dotenv
 
+# ----------------------------------------
+# Paths and Environment
+# ----------------------------------------
 HERE = Path(__file__).resolve().parent
-ENV_PATH = (HERE / ".." / ".." / ".env").resolve()
+LOCAL_ENV_PATH = (HERE / ".." / ".." / ".env").resolve()
 
-if ENV_PATH.exists():
-    load_dotenv(dotenv_path=str(ENV_PATH))
+# Load local .env if exists (for local dev)
+if LOCAL_ENV_PATH.exists():
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=str(LOCAL_ENV_PATH))
 else:
-    print(f"[WARN] .env not found at expected location: {ENV_PATH}")
+    print(f"[INFO] Local .env not found at {LOCAL_ENV_PATH}, relying on system envs or Render secrets.")
 
+# Render secret paths
+RENDER_SECRETS_PATH = Path("/etc/secrets")
+
+ENV_FILE_RENDER = RENDER_SECRETS_PATH / ".env"
+GOOGLE_CREDS_RENDER = RENDER_SECRETS_PATH / "google-credentials.json"
+
+# ----------------------------------------
+# Settings
+# ----------------------------------------
 class Settings(BaseSettings):
+    # Google AI & GCP
     GOOGLE_APPLICATION_CREDENTIALS: str | None = None
     GCP_PROJECT: str | None = None
     GCP_REGION: str = "us-central1"
     TEXT_MODEL_ID: str = "gemini-2.5-flash"
 
-    # Custom Search (programmable search)
+    # Custom Search
     GOOGLE_SEARCH_API_KEY: str | None = None
     GOOGLE_SEARCH_CX: str | None = None
 
+    # SMTP Email
     SMTP_HOST: str | None = None
     SMTP_PORT: int | None = None
     SMTP_USER: str | None = None
     SMTP_PASS: str | None = None
-
-    # Where automated reports should be sent (optional)
     REPORT_TO_EMAIL: str | None = None
 
     class Config:
-        env_file = str(ENV_PATH)
+        # Local dev fallback, Render secrets take priority
+        env_file = str(ENV_FILE_RENDER) if ENV_FILE_RENDER.exists() else str(LOCAL_ENV_PATH)
         env_file_encoding = "utf-8"
 
-settings = Settings(_env_file=str(ENV_PATH))
+# ----------------------------------------
+# Instantiate settings
+# ----------------------------------------
+settings = Settings()
+
+# Override Google credentials path if Render secret exists
+if GOOGLE_CREDS_RENDER.exists():
+    settings.GOOGLE_APPLICATION_CREDENTIALS = str(GOOGLE_CREDS_RENDER)
