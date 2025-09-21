@@ -1,28 +1,14 @@
 services:
-  frontend:
+  vishwas-app:
     build:
-      context: ./frontend
+      context: .
       dockerfile: Dockerfile
-    container_name: vishwas_frontend
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./frontend:/app:cached
-    environment:
-      - CHOKIDAR_USEPOLLING=true
-    command: npm run dev -- --host 0.0.0.0 --port 3000
-
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-      args:
-        ENV: dev
-    container_name: vishwas_backend
+    container_name: vishwas-app
     ports:
       - "8000:8000"
+    volumes:
+      - ./backend:/app/backend:cached
+      - ./frontend:/app/frontend:cached
+      - ./backend/google-credentials.json:/secrets/google-credentials.json:ro
     env_file:
       - ./backend/.env
-    volumes:
-      - ./backend:/app:cached
-      - ./backend/google-credentials.json:/secrets/google-credentials.json:ro

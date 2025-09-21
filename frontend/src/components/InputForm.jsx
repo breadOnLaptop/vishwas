@@ -10,7 +10,8 @@ export default function InputForm({ onAnalyze }) {
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === "Escape") {
-        setText(""); setFile(null);
+        setText("");
+        setFile(null);
         if (fileRef.current) fileRef.current.value = "";
       }
     };
@@ -21,23 +22,21 @@ export default function InputForm({ onAnalyze }) {
   const submitText = async (e) => {
     e?.preventDefault();
     if (!text.trim()) return;
-    const fd = new FormData();
-    fd.append("text", text.trim());
-    await onAnalyze(fd, "text");
+    await onAnalyze(text.trim(), "text"); // pass string
   };
 
   const submitFile = async (e) => {
     e?.preventDefault();
     if (!file) return;
-    const fd = new FormData();
-    fd.append("file", file);
-    await onAnalyze(fd, "image");
+    await onAnalyze(file, "image"); // pass File object
   };
 
   return (
     <div className="card">
       <form className="glass" onSubmit={submitText} aria-label="Analyze form">
-        <label className="input-label" htmlFor="glass-textarea">Enter text to analyze</label>
+        <label className="input-label" htmlFor="glass-textarea">
+          Enter text to analyze
+        </label>
 
         <textarea
           id="glass-textarea"
@@ -45,8 +44,10 @@ export default function InputForm({ onAnalyze }) {
           className="glass-textarea"
           placeholder="Paste text, a claim, or a URL to check… (Ctrl/Cmd+Enter to analyze)"
           value={text}
-          onChange={(e)=>setText(e.target.value)}
-          onKeyDown={(e)=>{ if ((e.ctrlKey||e.metaKey) && e.key === "Enter") submitText(e); }}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === "Enter") submitText(e);
+          }}
           aria-label="Text to analyze"
         />
 
@@ -56,15 +57,19 @@ export default function InputForm({ onAnalyze }) {
           </button>
 
           <div className="file-input" style={{ marginLeft: 8 }}>
-            <label className="btn ghost" htmlFor="file-upload" style={{ cursor: "pointer" }}>Choose file</label>
+            <label className="btn ghost" htmlFor="file-upload" style={{ cursor: "pointer" }}>
+              Choose file
+            </label>
             <input
               id="file-upload"
               ref={fileRef}
               type="file"
               accept="image/*,.pdf,.docx,.txt"
-              onChange={(e)=>setFile(e.target.files?.[0] ?? null)}
+              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
             />
-            <div className="file-name">{ file ? file.name : <span className="helper">No file chosen</span> }</div>
+            <div className="file-name">
+              {file ? file.name : <span className="helper">No file chosen</span>}
+            </div>
           </div>
 
           <button
@@ -83,7 +88,12 @@ export default function InputForm({ onAnalyze }) {
             <button
               type="button"
               className="btn"
-              onClick={() => { setText(""); setFile(null); if (fileRef.current) fileRef.current.value = ""; taRef.current?.focus(); }}
+              onClick={() => {
+                setText("");
+                setFile(null);
+                if (fileRef.current) fileRef.current.value = "";
+                taRef.current?.focus();
+              }}
               title="Clear"
             >
               Clear

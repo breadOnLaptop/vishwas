@@ -13,12 +13,21 @@ export default function App() {
   const [bgClass, setBgClass] = useState("");
   const [showSplash, setShowSplash] = useState(true);
 
-  const handleAnalysis = async (formData, type = "text") => {
+  const handleAnalysis = async (input, type = "text") => {
     setLoading(true);
     setResult(null);
     try {
-      const res = type === "image" ? await api.analyzeImage(formData) : await api.analyzeText(formData);
+      let res;
+      if (type === "image") {
+        res = await api.analyzeImage(input);
+      } else if (type === "document") {
+        res = await api.analyzeDocument(input);
+      } else {
+        res = await api.analyzeText(input);
+      }
+
       setResult(res);
+
       const color = res?.color;
       if (color === "red") setBgClass("red-bg");
       else if (color === "orange") setBgClass("orange-bg");
