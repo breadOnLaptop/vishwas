@@ -760,11 +760,48 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
                 parsed_candidate = _vertex_parse_structured(raw_text)
                 explanation_str = raw_text
                 if parsed_candidate and parsed_candidate.get("claims"):
+                    # PRESERVE model-provided verdicts/confidences when present.
                     for c in parsed_candidate.get("claims", []):
-                        ctext = c.get("text", "")
-                        conf, hits = _verify_claim_with_search(ctext, num=5)
-                        c["misp_confidence"] = float(max(0.0, min(1.0, conf)))
-                        c["references"] = _prioritize_sources(hits) if hits else []
+                        ctext = c.get("text", "") or ""
+
+                        # detect model-provided numeric confidence if present
+                        model_provided_conf = None
+                        try:
+                            if isinstance(c.get("misp_confidence"), (int, float, str)):
+                                model_provided_conf = float(c.get("misp_confidence"))
+                        except Exception:
+                            model_provided_conf = None
+
+                        model_provided_verdict = None
+                        try:
+                            if isinstance(c.get("verdict"), str) and c.get("verdict").strip() != "":
+                                model_provided_verdict = str(c.get("verdict")).lower().strip()
+                        except Exception:
+                            model_provided_verdict = None
+
+                        # Attach references if model did not provide them
+                        if not c.get("references"):
+                            conf, hits = _verify_claim_with_search(ctext, num=5)
+                            c["references"] = _prioritize_sources(hits) if hits else []
+                            # only set misp_confidence from search IF the model did NOT provide any verdict/confidence
+                            if model_provided_conf is None and not model_provided_verdict:
+                                c["misp_confidence"] = float(max(0.0, min(1.0, conf)))
+                        else:
+                            # references already present from model; still compute a fallback numeric if model provided nothing
+                            if model_provided_conf is None and not model_provided_verdict:
+                                conf, _ = _verify_claim_with_search(ctext, num=5)
+                                c["misp_confidence"] = float(max(0.0, min(1.0, conf)))
+
+                        # If the model provided a verdict but not a numeric, map it deterministically
+                        if model_provided_verdict and not isinstance(c.get("misp_confidence"), (int, float)):
+                            v = model_provided_verdict
+                            if v == "true":
+                                c["misp_confidence"] = 1.0
+                            elif v == "false":
+                                c["misp_confidence"] = 0.0
+                            elif v in ("mixed", "undecided"):
+                                c["misp_confidence"] = 0.5
+
                     parsed = parsed_candidate
             except Exception as e:
                 debug["vertex_error"] = str(e)
