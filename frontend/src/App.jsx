@@ -3,6 +3,7 @@ import Header from "./components/Header";
 import InputForm from "./components/InputForm";
 import AnalysisResult from "./components/AnalysisResult";
 import Loader from "./components/Loader";
+import LoaderScreen from "./components/LoaderScreen";
 import "./index.css";
 import api from "./api";
 
@@ -10,6 +11,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [bgClass, setBgClass] = useState("");
+  const [showSplash, setShowSplash] = useState(true);
 
   const handleAnalysis = async (formData, type = "text") => {
     setLoading(true);
@@ -17,8 +19,6 @@ export default function App() {
     try {
       const res = type === "image" ? await api.analyzeImage(formData) : await api.analyzeText(formData);
       setResult(res);
-
-      // small themed background hint (keeps original behavior)
       const color = res?.color;
       if (color === "red") setBgClass("red-bg");
       else if (color === "orange") setBgClass("orange-bg");
@@ -33,14 +33,19 @@ export default function App() {
   };
 
   return (
-    <div className={`app-container ${bgClass}`} role="application">
-      <Header />
-      <main style={{ width: "100%", display: "flex", justifyContent: "center" }}>
-        <div style={{ width: "100%", maxWidth: 1000 }}>
-          <InputForm onAnalyze={handleAnalysis} />
-          {loading ? <Loader /> : result && <AnalysisResult result={result} />}
+    <>
+      {showSplash && <LoaderScreen onLoaded={() => setShowSplash(false)} />}
+      {!showSplash && (
+        <div className={`app-container ${bgClass}`} role="application">
+          <Header />
+          <main style={{ width: "100%", display: "flex", justifyContent: "center" }}>
+            <div style={{ width: "100%", maxWidth: 1000 }}>
+              <InputForm onAnalyze={handleAnalysis} />
+              {loading ? <Loader /> : result && <AnalysisResult result={result} />}
+            </div>
+          </main>
         </div>
-      </main>
-    </div>
+      )}
+    </>
   );
 }
