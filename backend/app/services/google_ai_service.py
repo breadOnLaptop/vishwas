@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.core.config import settings  # your config object (must expose GOOGLE_SEARCH_API_KEY, GOOGLE_APPLICATION_CREDENTIALS, SMTP_* etc.)
+from app.core.config import settings  # your config object
 
 logger = logging.getLogger("google_ai_service")
 logger.setLevel(logging.INFO)
@@ -26,6 +26,7 @@ if settings.GOOGLE_APPLICATION_CREDENTIALS and os.path.exists(settings.GOOGLE_AP
     logger.info(f"Using GOOGLE_APPLICATION_CREDENTIALS: {settings.GOOGLE_APPLICATION_CREDENTIALS}")
 else:
     logger.warning("GOOGLE_APPLICATION_CREDENTIALS is not set or file does not exist; Vision/Vertex may be disabled.")
+
 
 # -----------------
 # Vision client init (robust)
@@ -46,6 +47,7 @@ except Exception as e:
     VISION_CLIENT = None
     vision = None
     logger.warning(f"google-cloud-vision import/init failed: {e}")
+
 
 # -----------------
 # Vertex init (try both generative_models and language_models)
@@ -81,6 +83,7 @@ except Exception as e:
     vertex_available = False
     logger.warning(f"Vertex import/init overall failed: {e}")
 
+
 # -----------------
 # Trusted domains & authoritative support domains
 # -----------------
@@ -92,6 +95,31 @@ _TRUSTED_SUPPORT_DOMAINS: List[str] = [
     "who.int", "cdc.gov", "nih.gov", "nhs.uk", "clevelandclinic.org",
     "mayoclinic.org", "bhf.org.uk", "webmd.com", "healthline.com"
 ]
+
+
+# -----------------
+# Helper: normalize a reference / source dict
+# -----------------
+def _normalize_ref(r: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Ensure every reference uses the normalized schema:
+    {title, link, snippet, publisher} - strings (empty when missing)
+    """
+    try:
+        title = r.get("title") or r.get("publisher") or ""
+        link = r.get("link") or r.get("claim_url") or r.get("url") or ""
+        snippet = r.get("snippet") or r.get("text") or ""
+        publisher = r.get("publisher") or ""
+        # sanitize lengths to avoid huge payloads
+        return {
+            "title": str(title)[:300],
+            "link": str(link)[:2000],
+            "snippet": str(snippet)[:800],
+            "publisher": str(publisher)[:200],
+        }
+    except Exception:
+        return {"title": "", "link": "", "snippet": "", "publisher": ""}
+
 
 # -----------------
 # Custom Search helper
@@ -133,7 +161,7 @@ def _search_web_google_customsearch(query: str, num: int = 3, site_filter: Optio
                 out.append({"title": it.get("title", ""), "link": it.get("link", ""), "snippet": it.get("snippet", "")})
             return out[:num]
     except Exception as e:
-        logger.debug(f"googleapiclient failed: {e}. Trying HTTP fallback.")
+        logger.debug(f"googleapiclient failed: {e}. Using HTTP fallback.")
         try:
             import httpx  # type: ignore
             params = {"key": api_key, "cx": cx, "q": query, "num": str(num)}
@@ -148,15 +176,11 @@ def _search_web_google_customsearch(query: str, num: int = 3, site_filter: Optio
             logger.warning(f"Custom Search HTTP fallback failed: {e2}")
     return out
 
+
 # -----------------
 # Fact Check Tools helper (HTTP call)
 # -----------------
 def _factcheck_search(claim: str, num: int = 5) -> List[Dict[str, Any]]:
-    """
-    Query Google Fact Check Tools API (v1alpha1).
-    Requires settings.GOOGLE_SEARCH_API_KEY to be set.
-    Returns list of dicts with keys: text, claim_url, publisher, textualRating, title, snippet
-    """
     api_key = settings.GOOGLE_SEARCH_API_KEY
     if not api_key:
         return []
@@ -186,8 +210,9 @@ def _factcheck_search(claim: str, num: int = 5) -> List[Dict[str, Any]]:
         logger.debug(f"FactCheck API call failed: {e}")
         return []
 
+
 # -----------------
-# Additional helpers for fact-check verdict normalization
+# Additional helpers & normalization
 # -----------------
 def _normalize_textual_rating_to_verdict(textual: Optional[str]) -> Optional[str]:
     if not textual:
@@ -204,6 +229,7 @@ def _normalize_textual_rating_to_verdict(textual: Optional[str]) -> Optional[str
     if "mostly true" in t or "partly" in t or "mixture" in t:
         return "mixed"
     return None
+
 
 def _pick_decisive_factcheck(fc_hits: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not fc_hits:
@@ -224,9 +250,7 @@ def _pick_decisive_factcheck(fc_hits: List[Dict[str, Any]]) -> Optional[Dict[str
     h_copy["verdict"] = "undecided"
     return h_copy
 
-# -----------------
-# helpers
-# -----------------
+
 def _parse_number_from_text(text: str) -> Optional[float]:
     if not text:
         return None
@@ -240,6 +264,7 @@ def _parse_number_from_text(text: str) -> Optional[float]:
             return None
     return None
 
+
 def _strip_code_fences(s: Optional[str]) -> str:
     if not s:
         return ""
@@ -249,6 +274,7 @@ def _strip_code_fences(s: Optional[str]) -> str:
     if s2.startswith("`") and s2.endswith("`"):
         s2 = s2.strip("`")
     return s2
+
 
 def _vertex_parse_structured(text_out: Optional[str]) -> Optional[Dict[str, Any]]:
     if not text_out:
@@ -268,6 +294,7 @@ def _vertex_parse_structured(text_out: Optional[str]) -> Optional[Dict[str, Any]
                 return None
     return None
 
+
 def _is_trusted_link(link: Optional[str]) -> bool:
     if not link:
         return False
@@ -280,6 +307,7 @@ def _is_trusted_link(link: Optional[str]) -> bool:
         pass
     return False
 
+
 def _is_supportive_domain(link: Optional[str]) -> bool:
     if not link:
         return False
@@ -291,6 +319,7 @@ def _is_supportive_domain(link: Optional[str]) -> bool:
     except Exception:
         pass
     return False
+
 
 def _prioritize_sources(hits: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
@@ -305,12 +334,17 @@ def _prioritize_sources(hits: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             trusted.append(hit)
         else:
             others.append(hit)
-    return trusted + others
+    combined = trusted + others
+    # normalize each ref
+    return [_normalize_ref(dict(h)) for h in combined]
+
 
 # -----------------
 # verify claim using fact-check API + fallback
 # -----------------
 def _verify_claim_with_search(claim: str, num: int = 5) -> Tuple[float, List[Dict[str, Any]]]:
+    conf = 0.5
+    hits: List[Dict[str, Any]] = []
     try:
         fc_hits = _factcheck_search(claim, num=num)
         if fc_hits:
@@ -318,29 +352,49 @@ def _verify_claim_with_search(claim: str, num: int = 5) -> Tuple[float, List[Dic
             if decisive:
                 verdict = decisive.get("verdict")
                 if verdict == "false":
-                    return 0.0, fc_hits
+                    conf = 0.0
+                    hits = fc_hits
+                    norm_hits = [_normalize_ref(h) for h in hits][:5]
+                    return float(conf), norm_hits
                 if verdict == "true":
-                    return 1.0, fc_hits
-            return 0.2, fc_hits
+                    conf = 1.0
+                    hits = fc_hits
+                    norm_hits = [_normalize_ref(h) for h in hits][:5]
+                    return float(conf), norm_hits
+            # no decisive verdict but have hits
+            conf = 0.2
+            hits = fc_hits
+            norm_hits = [_normalize_ref(h) for h in hits][:5]
+            return float(conf), norm_hits
     except Exception as e:
         logger.debug(f"Fact-check check failed: {e}")
 
     try:
         hits = _search_web_google_customsearch(f"{claim}", num=num)
         if hits:
+            # if any supportive domain -> truthy
             for h in hits:
                 link = h.get("link") or ""
                 if _is_supportive_domain(link):
-                    return 1.0, hits
+                    conf = 1.0
+                    norm_hits = [_normalize_ref(hh) for hh in hits][:5]
+                    return float(conf), norm_hits
+            # check snippets for debunk signals
             for h in hits:
                 snippet = (h.get("snippet") or "").lower()
                 if any(k in snippet for k in ("false", "debunk", "no evidence", "hoax", "misleading")):
-                    return 0.0, hits
-            return 0.5, hits
+                    conf = 0.0
+                    norm_hits = [_normalize_ref(hh) for hh in hits][:5]
+                    return float(conf), norm_hits
+            conf = 0.5
+            norm_hits = [_normalize_ref(hh) for hh in hits][:5]
+            return float(conf), norm_hits
     except Exception as e:
         logger.debug(f"Generic search failed: {e}")
 
-    return 0.5, []
+    # default fallback
+    return float(conf), []
+
 
 # -----------------
 # normalize confidences
@@ -359,6 +413,7 @@ _false_keywords: List[str] = [
     "conspiracy", "untrue", "incorrect", "not true", "disproved", "hoax",
     "fake", "unsupported", "refuted"
 ]
+
 
 def _normalize_parsed_confidences(parsed: Dict[str, Any], explanation_text: str) -> Tuple[Dict[str, Any], Optional[float]]:
     if not parsed or not isinstance(parsed, dict):
@@ -423,6 +478,7 @@ def _normalize_parsed_confidences(parsed: Dict[str, Any], explanation_text: str)
         parsed["overall_misp_confidence"] = overall
 
     return parsed, overall
+
 
 # -----------------
 # Vision analyze (robust)
@@ -525,26 +581,28 @@ def analyze_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
         logger.warning(f"Vision annotate failed: {e}")
         return {"text": "", "labels": [], "safe_search": {}, "safe_search_score": None, "web": {}, "raw": {}}
 
+
 # -----------------
-# Main analyze_content
+# Main analyze_content (updated to return canonical JSON)
 # -----------------
 def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, source_url: Optional[str] = None) -> Dict[str, Any]:
     """
-    Analyze text + optional image. This function returns a structured dict containing:
-      - misp_confidence (0..1 where 0 = misinformation, 1 = truthful)
-      - color
-      - explanation (detailed JSON or raw model output)
-      - user_explanation (short user facing summary)
-      - parsed (structured claims)
-      - vision (vision_result)
-      - sources, top_sources, debug
-    NOTE: This function does NOT auto-send reports. Use report_if_severe(...) to trigger reports.
+    Analyze text + optional image.
+
+    Returns canonical dict with:
+      - score: 0..10 (trustworthiness; higher = more truthful)
+      - color: "red"|"orange"|"green"
+      - user_explanation: short summary
+      - top_sources: normalized list
+      - parsed: structured claims with per-claim confidence
+      - debug: internal debug info
     """
     debug: Dict[str, Any] = {}
     parsed: Optional[Dict[str, Any]] = None
     explanation_str: str = ""
     misp_conf: float = 0.5
 
+    # call vision if image bytes given
     vision_result = analyze_image_bytes(image_bytes) if image_bytes else {"text": "", "labels": [], "safe_search": {}, "safe_search_score": None, "web": {}, "raw": {}}
     ocr_text: str = (vision_result.get("text") or "") if isinstance(vision_result, dict) else ""
     image_labels: List[str] = vision_result.get("labels") or []
@@ -609,7 +667,6 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
                 hits = default_page_hits
             c["misp_confidence"] = float(max(0.0, min(1.0, conf)))
             c["references"] = _prioritize_sources(hits) if hits else []
-
         try:
             scores = [float(c.get("misp_confidence", 0.5)) for c in parsed["claims"] if isinstance(c, dict)]
             parsed["overall_misp_confidence"] = (sum(scores) / max(1, len(scores))) if scores else None
@@ -710,7 +767,7 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
         except Exception as e:
             logger.warning(f"Normalization failed: {e}")
 
-    # derive misp_confidence
+    # derive misp_confidence (0..1)
     if parsed:
         if corrected_overall is not None:
             misp_conf = float(max(0.0, min(1.0, corrected_overall)))
@@ -765,12 +822,12 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
                     existing_refs = hits
 
                 try:
-                    c["references"] = existing_refs
+                    c["references"] = [_normalize_ref(r) for r in (existing_refs or [])][:5]
                 except Exception:
-                    pass
+                    c["references"] = []
 
-                sources_result.append({"claim": claim_text, "sources": existing_refs})
-                for hit in existing_refs:
+                sources_result.append({"claim": claim_text, "sources": c.get("references")})
+                for hit in c.get("references", []):
                     link_var = hit.get("link") or hit.get("claim_url") or ""
                     if link_var and link_var not in [t.get("link") for t in top_links]:
                         top_links.append(hit)
@@ -792,8 +849,9 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
             if query:
                 hits = _search_web_google_customsearch(query, num=5)
                 if hits:
-                    sources_result.append({"claim": query, "sources": hits})
-                    for hit in hits:
+                    hits_norm = [_normalize_ref(h) for h in hits][:5]
+                    sources_result.append({"claim": query, "sources": hits_norm})
+                    for hit in hits_norm:
                         link_var = hit.get("link")
                         if link_var and link_var not in [t.get("link") for t in top_links]:
                             top_links.append(hit)
@@ -820,7 +878,7 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
                             c["misp_confidence"] = 0.0
                         elif decisive.get("verdict") == "true":
                             c["misp_confidence"] = 1.0
-                        c["references"] = fc_hits or refs
+                        c["references"] = [_normalize_ref(h) for h in (fc_hits or refs)][:5]
                         break
                 except Exception:
                     pass
@@ -875,17 +933,48 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
 
     user_explanation = " ".join(user_explanation_parts[:6])
 
-    return {
-        "misp_confidence": misp_conf,
-        "color": map_confidence_to_color(misp_conf),
-        "explanation": explanation_pretty,
+    # --- finalize result using compute_misinfo_score ---
+    try:
+        # import here to avoid circular import at module load
+        from app.services.analysis_service import compute_misinfo_score
+        misinfo = compute_misinfo_score(
+            text_signal=float(misp_conf),
+            image_safe_search=vision_result.get("safe_search_score"),
+            image_labels=image_labels,
+            ocr_text=ocr_text,
+            llm_debug=debug.get("vertex_raw")
+        )
+    except Exception as e:
+        logger.debug(f"compute_misinfo_score failed: {e}")
+        # fallback mapping: trustworthiness = misp_conf
+        trust = float(max(0.0, min(1.0, misp_conf)))
+        misinfo = {"score": round(trust * 10.0, 2), "color": map_confidence_to_color(trust), "top_reasons": []}
+
+    # normalize top_links
+    norm_top_links = [_normalize_ref(t) for t in top_links][:5]
+
+    # normalize per-claim fields (add 0..10 variant)
+    if parsed and isinstance(parsed.get("claims"), list):
+        for c in parsed["claims"]:
+            refs = c.get("references") or []
+            c["references"] = [_normalize_ref(r) for r in refs][:5]
+            misp_val = float(c.get("misp_confidence", 0.5))
+            c["misp_confidence_0_1"] = misp_val
+            c["confidence_0_10"] = round(misp_val * 10.0, 2)
+
+    # final payload
+    result = {
+        "score": float(misinfo.get("score", 5.0)),
+        "color": misinfo.get("color", map_confidence_to_color(misp_conf)),
+        "top_reasons": misinfo.get("top_reasons", []),
         "user_explanation": user_explanation,
-        "parsed": parsed,
-        "debug": debug,
-        "vision": vision_result,
-        "sources": sources_result,
-        "top_sources": top_links
+        "top_sources": norm_top_links,
+        "parsed": parsed or {"claims": [], "overall_misp_confidence": None},
+        "debug": debug
     }
+
+    return result
+
 
 # map to color (small helper)
 def map_confidence_to_color(misp_confidence: float) -> str:
@@ -899,6 +988,7 @@ def map_confidence_to_color(misp_confidence: float) -> str:
         return "orange"
     else:
         return "green"
+
 
 # send report (safe-guard optional SMTP values)
 def send_misinformation_report(subject: str, body: str, to_email: str) -> None:
@@ -930,6 +1020,7 @@ def send_misinformation_report(subject: str, body: str, to_email: str) -> None:
         logger.info(f"Report email sent to {to_email}")
     except Exception as e:
         logger.error(f"Failed to send report email: {e}")
+
 
 # -----------------
 # Reporting helper: build a human-friendly report and trigger email if severe
@@ -993,9 +1084,10 @@ def _build_report_body(analysis_result: Dict[str, Any], reporter: str = "misinfo
         body += "(failed to encode full JSON)\n"
     return body
 
+
 def report_if_severe(analysis_result: Dict[str, Any], report_to_email: Optional[str] = None, severity_threshold_score: float = 4.0) -> None:
     """
-    analysis_result: the dict returned by analyze_content (contains misp_confidence 0..1)
+    analysis_result: the dict returned by analyze_content (contains score 0..10)
     severity_threshold_score: 0..10 where lower means more severe. If computed score < threshold, send report.
     """
     try:
@@ -1007,7 +1099,6 @@ def report_if_severe(analysis_result: Dict[str, Any], report_to_email: Optional[
     trustworthiness = float(max(0.0, min(1.0, misp_conf)))
     score_0_10 = round(trustworthiness * 10.0, 2)
 
-    # severity (0..10) where lower = severe.
     severity_score = score_0_10
 
     if severity_score < severity_threshold_score:

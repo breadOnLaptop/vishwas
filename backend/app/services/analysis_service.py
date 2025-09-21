@@ -9,9 +9,11 @@ def compute_misinfo_score(
     llm_debug: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """
-    Convert signals into a 0..10 *trustworthiness* score (higher => more likely truthful/good).
-    - text_signal: 0..1 where 0 = misinformation, 1 = truthful/safe
+    Convert signals into a 0..10 trustworthiness score (higher => more truthful).
+    - text_signal: 0..1 where 0 = misinformation, 1 = truthful
     - image_safe_search: 0..1 where 0 = unsafe, 1 = safe. If None -> treat as safe (1.0).
+    Returns:
+      {"score": float (0..10), "color": str, "top_reasons": List[str]}
     """
     if image_labels is None:
         image_labels = []
