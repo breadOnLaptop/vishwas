@@ -679,20 +679,57 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
     # 2) If no deterministic claims, call Vertex once (strict prompt)
     if not parsed:
         strict_prompt = (
-            "You are a strict fact-check assistant. ONLY return factual claims that are directly supported "
-            "by the provided OCR text, image labels or web-detection. DO NOT INVENT OR GUESS. "
-            "Return ONLY a JSON object with keys: claims (array), overall_misp_confidence (0..1), top_reasons (array).\n\n"
+            "You are a strict factual-evidence assistant used inside an automated pipeline. "
+            "OBEY THESE INSTRUCTIONS EXACTLY and return ONLY a JSON object (no natural-language explanation, no extra keys):\n\n"
+
+            "OUTPUT SCHEMA (required):\n"
             "{\n"
-            '  "claims": [ { "text":"...", "misp_confidence":0.0, "short_reason":"...", "references": [] } ],\n'
-            '  "overall_misp_confidence": 0.5,\n'
-            '  "top_reasons": []\n'
+            '  "claims": [\n'
+            '    {\n'
+            '      "text": "<claim text>",\n'
+            '      "verdict": "<true|false|mixed|undecided>",\n'
+            '      "misp_confidence": 0.0,  # number between 0.0 (false/misinformation) and 1.0 (true/accurate)\n'
+            '      "short_reason": "<one-line reason why verdict was chosen>",\n'
+            '      "evidence": [ { "title":"", "link":"", "publisher":"", "snippet":"", "authoritative": true|false } ]\n'
+            '    }\n'
+            '  ],\n'
+            '  "overall_misp_confidence": 0.5,  # numeric 0..1 (average truthiness across claims)\n'
+            '  "top_reasons": [ "<short human-readable bullets why claims were rated>" ]\n'
             "}\n\n"
+
+            "MANDATORY RULES (must follow):\n"
+            "1) IDENTIFY ONLY factual claims that are directly supported by the INPUT (OCR text, image labels, web-entities, or Source URL). DO NOT INVENT claims.\n"
+            "2) For each claim set `verdict` to exactly one of: true, false, mixed, undecided.\n"
+            "   - true = claim is supported by authoritative evidence (scientific bodies, official docs, established journalism).\n"
+            "   - false = claim is contradicted by authoritative fact-check(s) or authoritative sources.\n"
+            "   - mixed = claim contains both true and false parts, or true only under limited context.\n"
+            "   - undecided = no reliable evidence either way.\n"
+            "3) `misp_confidence` MUST be consistent with `verdict` using this default mapping (unless you include a clear exception in short_reason):\n"
+            "   - false -> 0.0\n"
+            "   - true -> 1.0\n"
+            "   - mixed -> 0.5\n"
+            "   - undecided -> 0.5\n"
+            "   If you deviate, put the numeric you choose and EXPLAIN the reason briefly in `short_reason` and cite evidence.\n"
+            "4) Populate `evidence` entries with any publisher/title/link/snippet you found from the inputs or web lookups. Mark `authoritative=true` for known fact-checkers, government, or scientific organizations.\n"
+            "5) If you locate a fact-check that explicitly labels the claim FALSE, you MUST set verdict=false and misp_confidence=0.0 and include that fact-check as evidence with `authoritative=true`.\n"
+            "6) Use only the exact verdict keywords (true|false|mixed|undecided). Do NOT use synonyms like 'probably' or 'likely' as the verdict.\n"
+            "7) If no claims can be extracted, return `claims: []` and `overall_misp_confidence: 0.5`.\n"
+            "8) Keep `top_reasons` to 1-3 concise bullets summarizing the strongest signals.\n\n"
+
+            "INPUT (use these when extracting claims):\n"
             f"Input OCR text:\n{ocr_text}\n\n"
             f"Image labels: {', '.join(image_labels) if image_labels else '(none)'}\n\n"
             f"Web entities: {', '.join(web_entities) if web_entities else '(none)'}\n\n"
             f"Source URL: {source_url_for_search if source_url_for_search else '(none)'}\n\n"
-            "If there are no supported claims, return claims: [] and overall_misp_confidence: 0.5.\n"
-            "Return JSON only."
+
+            "EXAMPLE (for clarity only — DO NOT output this example; follow schema above):\n"
+            '{ "claims":[ { "text":"The Sun will start rising from the west tomorrow.", "verdict":"false", "misp_confidence":0.0, '
+            '"short_reason":"Contradicted by authoritative astronomy sources (NASA/astronomy fact-check).", '
+            '"evidence":[{"title":"NASA: Earth rotation FAQ","link":"https://www.nasa.gov/...","publisher":"NASA","snippet":"Earth rotates eastward...", "authoritative":true}] } ], '
+            '"overall_misp_confidence":0.0, "top_reasons":["Contradicted by authoritative astronomy sources."] }\n\n'
+
+            "IMPORTANT: JSON ONLY. No commentary, no extra keys outside the schema, and ensure `verdict` + `misp_confidence` agree. "
+            "If you include an exception to the verdict->confidence mapping, justify it in `short_reason` and include concrete evidence entries in `evidence`."
         )
 
         if vertex_available:
