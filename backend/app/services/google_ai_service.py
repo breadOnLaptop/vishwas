@@ -93,19 +93,26 @@ _TRUSTED_FACTCHECK_DOMAINS: List[str] = [
     "reuters.com", "bbc.com", "fullfact.org", "afp.com", "factcheck.afp.com"
 ]
 _TRUSTED_SUPPORT_DOMAINS: List[str] = [
-    "who.int", "cdc.gov", "nih.gov", "nhs.uk", "clevelandclinic.org",
-    "mayoclinic.org", "bhf.org.uk", "webmd.com", "healthline.com"
+    "nasa.gov", "noaa.gov", "who.int", "cdc.gov", "nih.gov", "nhs.uk",
+    "clevelandclinic.org", "mayoclinic.org", "bhf.org.uk", "webmd.com", "healthline.com"
 ]
+
+
+# -----------------
+# Decision thresholds (tunable)
+# -----------------
+VERTEX_UNIVERSAL_THRESHOLD = 0.90  # vertex must be >= this to accept universal fact
+VERTEX_TRUE_THRESHOLD = 0.90
+VERTEX_FALSE_THRESHOLD = 0.10
+SIMILARITY_THRESHOLD = 0.7
+SUPPORT_SIMILARITY_THRESHOLD = 0.45
+SUPPORT_CHECK_UPPER = 0.85
 
 
 # -----------------
 # Helper: normalize a reference / source dict
 # -----------------
 def _normalize_ref(r: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Ensure every reference uses the normalized schema:
-    {title, link, snippet, publisher} - strings (empty when missing)
-    """
     try:
         title = r.get("title") or r.get("publisher") or ""
         link = r.get("link") or r.get("claim_url") or r.get("url") or ""
@@ -341,76 +348,307 @@ def _prioritize_sources(hits: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # -----------------
-# verify claim using fact-check API + fallback (unchanged)
+# semantic similarity (fallback)
 # -----------------
-def _verify_claim_with_search(claim: str, num: int = 5) -> Tuple[float, List[Dict[str, Any]]]:
-    conf = 0.5
-    hits: List[Dict[str, Any]] = []
+def semantic_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    ta = set([t for t in re.findall(r"\w+", a.lower()) if len(t) > 2])
+    tb = set([t for t in re.findall(r"\w+", b.lower()) if len(t) > 2])
+    if not ta or not tb:
+        return 0.0
+    inter = ta.intersection(tb)
+    union = ta.union(tb)
+    return float(len(inter)) / float(len(union))
+
+
+# -----------------
+# Vertex: classification helper (used for general classification)
+# -----------------
+def vertex_classify_claim(claim_text: str, context_snippets: List[Dict[str, str]], model: str = None) -> Dict[str, Any]:
+    model = model or (settings.TEXT_MODEL_ID or ("gemini-2.5-flash" if _vertex_model_api == "generative_models" else "text-bison@001"))
+
+    ctx_pieces = []
+    for s in (context_snippets or [])[:6]:
+        t = (s.get("title") or "")[:240].strip()
+        sn = (s.get("snippet") or "")[:400].strip()
+        url = s.get("link") or s.get("url") or ""
+        ctx_pieces.append(f"TITLE: {t}\nSNIPPET: {sn}\nURL: {url}")
+    context_text = "\n\n".join(ctx_pieces)
+
+    prompt = (
+        "You are a precise verifier. Input: a CLAIM and up to 6 CONTEXT snippets. "
+        "Output: a single JSON object (no extra text) with keys exactly: "
+        "verdict (true|false|mixed|undecided), misp_confidence (0.0-1.0), misp_confidence_0_1 (same), "
+        "confidence_0_10 (0-10), explanation (short string), references (array of objects with title,url,snippet,verdict).\n\n"
+        f"CLAIM: {claim_text}\n\nCONTEXT:\n{context_text}\n\nJSON:"
+    )
+
     try:
-        fc_hits = _factcheck_search(claim, num=num)
+        raw = ""
+        if vertex_available:
+            if _vertex_model_api == "generative_models":
+                from vertexai.generative_models import GenerativeModel  # type: ignore
+                m = GenerativeModel(model)
+                try:
+                    response = m.generate_content(prompt, generation_config={"temperature": 0.0, "max_output_tokens": 600})
+                except TypeError:
+                    response = m.generate_content(prompt)
+                raw = str(getattr(response, "text", response))
+            else:
+                from vertexai.language_models import TextGenerationModel  # type: ignore
+                m = TextGenerationModel.from_pretrained(model)
+                try:
+                    response = m.predict(prompt, max_output_tokens=600, temperature=0.0)
+                except TypeError:
+                    response = m.predict(prompt, max_output_tokens=600)
+                raw = str(response) if response else ""
+        else:
+            raise NotImplementedError("Vertex not available")
+        raw_text = _strip_code_fences(raw)
+        parsed = _vertex_parse_structured(raw_text)
+    except NotImplementedError:
+        parsed = None
+    except Exception as e:
+        logger.debug(f"vertex_classify_claim exception: {e}")
+        parsed = None
+
+    if not parsed:
+        return {
+            "verdict": "undecided",
+            "misp_confidence": 0.5,
+            "misp_confidence_0_1": 0.5,
+            "confidence_0_10": 5.0,
+            "explanation": "Vertex unavailable or returned invalid JSON; defaulted to uncertain.",
+            "references": context_snippets or []
+        }
+
+    try:
+        mc = float(parsed.get("misp_confidence", parsed.get("misp_confidence_0_1", 0.5)))
+    except Exception:
+        mc = 0.5
+    mc = max(0.0, min(1.0, mc))
+    try:
+        c10 = float(parsed.get("confidence_0_10", mc * 10.0))
+    except Exception:
+        c10 = mc * 10.0
+    c10 = max(0.0, min(10.0, c10))
+
+    parsed["misp_confidence"] = mc
+    parsed["misp_confidence_0_1"] = mc
+    parsed["confidence_0_10"] = c10
+    parsed["verdict"] = str(parsed.get("verdict") or "").lower() or None
+
+    refs = parsed.get("references") or []
+    normalized_refs = []
+    for r in refs:
+        try:
+            normalized_refs.append({
+                "title": r.get("title", "") if isinstance(r, dict) else str(r)[:200],
+                "link": r.get("url", r.get("link", "")) if isinstance(r, dict) else "",
+                "snippet": r.get("snippet", "") if isinstance(r, dict) else "",
+                "verdict": r.get("verdict", "") if isinstance(r, dict) else ""
+            })
+        except Exception:
+            continue
+    if not normalized_refs:
+        normalized_refs = context_snippets or []
+
+    parsed["references"] = normalized_refs
+    parsed["explanation"] = parsed.get("explanation", "") or ""
+    return parsed
+
+
+# -----------------
+# NEW: Vertex-only universal check
+# -----------------
+def vertex_universal_check(claim_text: str, model: str = None) -> Dict[str, Any]:
+    """
+    Ask Vertex if the claim is a universal/truth-of-fact statement.
+    Only Vertex is used here (no keyword heuristics). Vertex must return JSON with:
+      { "is_universal": true|false, "misp_confidence": 0.0-1.0, "explanation": "..."}
+    If Vertex fails to return JSON, fallback to {is_universal: False, misp_confidence: 0.5}
+    """
+    model = model or (settings.TEXT_MODEL_ID or ("gemini-2.5-flash" if _vertex_model_api == "generative_models" else "text-bison@001"))
+
+    prompt = (
+        "You are a strict factuality checker. Answer ONLY a JSON object (no extra commentary). "
+        "Task: given a short factual sentence (CLAIM), decide whether it should be considered a "
+        "'universal factual statement' (i.e., widely accepted, context-free factual statement like "
+        "'The Earth orbits the Sun', 'Water freezes at 0 °C at sea level', etc.).\n\n"
+        "OUTPUT SCHEMA (required):\n"
+        "{\n"
+        '  "is_universal": true|false,\n'
+        '  "misp_confidence": 0.0, # numeric 0..1 representing how confident you are that this is universally true\n'
+        '  "explanation": "one-line explanation or empty"\n'
+        "}\n\n"
+        f"CLAIM: {claim_text}\n\nJSON:"
+    )
+
+    try:
+        raw = ""
+        if vertex_available:
+            if _vertex_model_api == "generative_models":
+                from vertexai.generative_models import GenerativeModel  # type: ignore
+                m = GenerativeModel(model)
+                try:
+                    response = m.generate_content(prompt, generation_config={"temperature": 0.0, "max_output_tokens": 300})
+                except TypeError:
+                    response = m.generate_content(prompt)
+                raw = str(getattr(response, "text", response))
+            else:
+                from vertexai.language_models import TextGenerationModel  # type: ignore
+                m = TextGenerationModel.from_pretrained(model)
+                try:
+                    response = m.predict(prompt, max_output_tokens=300, temperature=0.0)
+                except TypeError:
+                    response = m.predict(prompt, max_output_tokens=300)
+                raw = str(response) if response else ""
+        else:
+            raise NotImplementedError("Vertex not available")
+        raw_text = _strip_code_fences(raw)
+        parsed = _vertex_parse_structured(raw_text)
+    except Exception as e:
+        logger.debug(f"vertex_universal_check failed: {e}")
+        parsed = None
+
+    if not parsed:
+        return {"is_universal": False, "misp_confidence": 0.5, "explanation": "Vertex unavailable or returned invalid JSON."}
+
+    is_univ = bool(parsed.get("is_universal", False))
+    try:
+        mc = float(parsed.get("misp_confidence", 0.5))
+    except Exception:
+        mc = 0.5
+    mc = max(0.0, min(1.0, mc))
+    return {"is_universal": is_univ, "misp_confidence": mc, "explanation": parsed.get("explanation", ""), "raw": parsed}
+
+
+# -----------------
+# verify_claim_pipeline (updated sequence as requested)
+# -----------------
+def verify_claim_pipeline(claim_obj: Dict[str, Any], language: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Sequence:
+      1) Vertex-only universal check (if vertex says universal with high confidence -> accept 10/10).
+      2) FactCheck API lookup (if decisive -> use its verdict).
+      3) CustomSearch (trusted support domains) -> if supportive authoritative page found -> accept 10/10.
+      4) Final Vertex call -> use vertex numeric score directly as final misp_confidence.
+    """
+    claim_text = (
+        claim_obj.get("claim_text")
+        or claim_obj.get("text")
+        or claim_obj.get("claim")
+        or claim_obj.get("title")
+        or ""
+    )
+    claim_text = str(claim_text).strip()
+    claim_obj.setdefault("references", [])
+    claim_obj.setdefault("explanation", "")
+
+    # 0) keep any pre-existing numeric
+    existing_num = None
+    try:
+        if isinstance(claim_obj.get("misp_confidence"), (int, float, str)):
+            existing_num = float(claim_obj.get("misp_confidence"))
+    except Exception:
+        existing_num = None
+
+    # --- STEP 1: Vertex-only universal check
+    try:
+        uni = vertex_universal_check(claim_text, model=(settings.TEXT_MODEL_ID or None))
+        logger.debug(f"vertex_universal_check -> {uni}")
+    except Exception as e:
+        logger.debug(f"vertex_universal_check exception: {e}")
+        uni = {"is_universal": False, "misp_confidence": 0.5, "explanation": "vertex check error"}
+
+    if uni.get("is_universal") and float(uni.get("misp_confidence", 0.5)) >= VERTEX_UNIVERSAL_THRESHOLD:
+        claim_obj["misp_confidence"] = 1.0
+        claim_obj["misp_confidence_0_1"] = 1.0
+        claim_obj["confidence_0_10"] = 10.0
+        claim_obj["explanation"] = f"Vertex universal-check accepted claim (confidence={uni.get('misp_confidence')})."
+        claim_obj["references"] = [] if not claim_obj.get("references") else claim_obj.get("references")
+        claim_obj["overridden_by_universal_vertex"] = True
+        return claim_obj
+
+    # --- STEP 2: FactCheck API lookup (authoritative)
+    try:
+        fc_hits = _factcheck_search(claim_text, num=6)
         if fc_hits:
             decisive = _pick_decisive_factcheck(fc_hits)
             if decisive:
-                verdict = decisive.get("verdict")
-                if verdict == "false":
-                    conf = 0.0
-                    hits = fc_hits
-                    norm_hits = [_normalize_ref(h) for h in hits][:5]
-                    return float(conf), norm_hits
-                if verdict == "true":
-                    conf = 1.0
-                    hits = fc_hits
-                    norm_hits = [_normalize_ref(h) for h in hits][:5]
-                    return float(conf), norm_hits
-            # no decisive verdict but have hits
-            conf = 0.2
-            hits = fc_hits
-            norm_hits = [_normalize_ref(h) for h in hits][:5]
-            return float(conf), norm_hits
+                textual_rating = decisive.get("textualRating") or decisive.get("snippet") or ""
+                mapped = {"misp_confidence": 0.5, "misp_confidence_0_1": 0.5, "confidence_0_10": 5.0}
+                # map textual to scores
+                if _normalize_textual_rating_to_verdict(textual_rating) == "false":
+                    mapped = {"misp_confidence": 0.0, "misp_confidence_0_1": 0.0, "confidence_0_10": 0.0}
+                elif _normalize_textual_rating_to_verdict(textual_rating) == "true":
+                    mapped = {"misp_confidence": 1.0, "misp_confidence_0_1": 1.0, "confidence_0_10": 10.0}
+                else:
+                    mapped = {"misp_confidence": 0.5, "misp_confidence_0_1": 0.5, "confidence_0_10": 5.0}
+
+                claim_obj["misp_confidence"] = mapped["misp_confidence"]
+                claim_obj["misp_confidence_0_1"] = mapped["misp_confidence_0_1"]
+                claim_obj["confidence_0_10"] = mapped["confidence_0_10"]
+                claim_obj["explanation"] = f"Authoritative fact-check matched (publisher={decisive.get('publisher')})."
+                claim_obj["references"] = [{
+                    "title": decisive.get("title") or decisive.get("text") or "",
+                    "link": decisive.get("claim_url") or decisive.get("url") or "",
+                    "snippet": decisive.get("snippet") or "",
+                    "publisher": decisive.get("publisher") or ""
+                }]
+                claim_obj["overridden_by_factcheck"] = True
+                return claim_obj
     except Exception as e:
-        logger.debug(f"Fact-check check failed: {e}")
+        logger.debug(f"Fact-check lookup failed: {e}")
+
+    # --- STEP 3: CustomSearch for trusted support domains (if found -> accept)
+    try:
+        support_hits = _search_web_google_customsearch(claim_text, num=5, site_filter=_TRUSTED_SUPPORT_DOMAINS) or []
+        if support_hits:
+            # pick first relevant supportive hit (no fuzzy scoring here; presence is treated as supportive)
+            first = support_hits[0]
+            if first and first.get("link"):
+                # Mark as supported by authoritative domain => accept true
+                claim_obj["misp_confidence"] = 1.0
+                claim_obj["misp_confidence_0_1"] = 1.0
+                claim_obj["confidence_0_10"] = 10.0
+                claim_obj["explanation"] = f"Supportive authoritative page found: {first.get('link')}"
+                claim_obj["references"] = [_normalize_ref(first)]
+                claim_obj["overridden_by_support_search"] = True
+                return claim_obj
+    except Exception as e:
+        logger.debug(f"Supportive customsearch failed: {e}")
+
+    # --- STEP 4: Final Vertex judgement (use Vertex numeric score directly as final)
+    try:
+        # gather some context from general customsearch (not used to override Vertex scoring — Vertex decides)
+        contexts = _search_web_google_customsearch(claim_text, num=6) or []
+    except Exception:
+        contexts = []
 
     try:
-        hits = _search_web_google_customsearch(f"{claim}", num=num)
-        if hits:
-            # if any supportive domain -> truthy
-            for h in hits:
-                link = h.get("link") or ""
-                if _is_supportive_domain(link):
-                    conf = 1.0
-                    norm_hits = [_normalize_ref(hh) for hh in hits][:5]
-                    return float(conf), norm_hits
-            # check snippets for debunk signals (kept minimal here; do not rely on arbitrary keywords)
-            for h in hits:
-                snippet = (h.get("snippet") or "").lower()
-                if any(k in snippet for k in ("false", "debunk", "no evidence", "hoax", "misleading")):
-                    conf = 0.0
-                    norm_hits = [_normalize_ref(hh) for hh in hits][:5]
-                    return float(conf), norm_hits
-            conf = 0.5
-            norm_hits = [_normalize_ref(hh) for hh in hits][:5]
-            return float(conf), norm_hits
+        vertex_final = vertex_classify_claim(claim_text, contexts, model=(settings.TEXT_MODEL_ID or None))
+        logger.debug(f"vertex_final -> {vertex_final}")
     except Exception as e:
-        logger.debug(f"Generic search failed: {e}")
+        logger.debug(f"vertex_classify_claim failed: {e}")
+        vertex_final = {"misp_confidence": 0.5, "verdict": "undecided", "explanation": "vertex error", "references": contexts}
 
-    # default fallback
-    return float(conf), []
+    final_mc = float(max(0.0, min(1.0, float(vertex_final.get("misp_confidence", 0.5)))))
+    claim_obj["misp_confidence"] = final_mc
+    claim_obj["misp_confidence_0_1"] = final_mc
+    claim_obj["confidence_0_10"] = round(final_mc * 10.0, 2)
+    claim_obj["explanation"] = vertex_final.get("explanation", "") or claim_obj.get("explanation", "")
+    claim_obj["references"] = vertex_final.get("references", claim_obj.get("references", []))
+    claim_obj["vertex_final_raw"] = vertex_final
+    # no additional combination — use vertex numeric directly
+    return claim_obj
 
 
 # -----------------
-# NEW: normalize confidences (keyword-free, factcheck-first)
+# normalize confidences (uses verify pipeline)
 # -----------------
 def _normalize_parsed_confidences(parsed: Dict[str, Any], explanation_text: str) -> Tuple[Dict[str, Any], Optional[float]]:
-    """
-    Replaces keyword heuristics with a deterministic, factual-first normalization.
-
-    Rules (deterministic, no keyword scanning on explanation_text):
-      1. If the claim object already contains a numeric misp_confidence (0..1), preserve it.
-      2. Else if claim has a 'verdict' field (true/false/mixed/undecided), map to numeric.
-      3. Else try to match authoritative Fact Check API results for the claim text; if a decisive fact-check exists, use it and attach references.
-      4. Else if references contain trusted fact-check domains -> set to true/false if claimReview info suggests it; otherwise use 0.5.
-      5. Else default to 0.5 (undecided).
-    """
     if not parsed or not isinstance(parsed, dict):
         return parsed, None
 
@@ -422,89 +660,19 @@ def _normalize_parsed_confidences(parsed: Dict[str, Any], explanation_text: str)
             c = {"text": str(c)}
             claims[idx] = c
 
-        claim_text = (c.get("text") or "").strip()
-        model_prov_num = None
-        # preserve model-provided numeric if present and valid
         try:
-            if isinstance(c.get("misp_confidence"), (int, float, str)):
-                model_prov_num = float(c.get("misp_confidence"))
-                if math.isnan(model_prov_num) or model_prov_num is None:
-                    model_prov_num = None
-            else:
-                model_prov_num = None
-        except Exception:
-            model_prov_num = None
-
-        # Step 1: numeric present -> keep it
-        if model_prov_num is not None:
-            corrected = float(max(0.0, min(1.0, model_prov_num)))
-            c["misp_confidence"] = corrected
-            corrected_scores.append(corrected)
-            continue
-
-        # Step 2: verdict mapping if present
-        verdict = None
-        try:
-            if isinstance(c.get("verdict"), str):
-                verdict = c.get("verdict").lower().strip()
-        except Exception:
-            verdict = None
-
-        if verdict:
-            if verdict == "true":
-                corrected = 1.0
-            elif verdict == "false":
-                corrected = 0.0
-            elif verdict in ("mixed", "undecided"):
-                corrected = 0.5
-            else:
-                corrected = 0.5
-            c["misp_confidence"] = corrected
-            corrected_scores.append(corrected)
-            continue
-
-        # Step 3: try authoritative fact-check match
-        try:
-            fc_hits = _factcheck_search(claim_text, num=5)
-            if fc_hits:
-                decisive = _pick_decisive_factcheck(fc_hits)
-                if decisive:
-                    dv = decisive.get("verdict")
-                    if dv == "false":
-                        corrected = 0.0
-                    elif dv == "true":
-                        corrected = 1.0
-                    else:
-                        corrected = 0.5
-                    # attach normalized fact-check references
-                    c["references"] = [_normalize_ref(h) for h in fc_hits][:5]
-                    c["misp_confidence"] = corrected
-                    corrected_scores.append(corrected)
-                    continue
+            updated = verify_claim_pipeline(c)
+            claims[idx] = updated
+            corrected_scores.append(float(updated.get("misp_confidence", 0.5)))
         except Exception as e:
-            logger.debug(f"Fact-check lookup during normalization failed for claim '{claim_text}': {e}")
+            logger.debug(f"_normalize_parsed_confidences: verify_claim_pipeline failed for claim '{c.get('text','')}' : {e}")
+            try:
+                mc = float(c.get("misp_confidence", 0.5))
+            except Exception:
+                mc = 0.5
+            c["misp_confidence"] = mc
+            corrected_scores.append(mc)
 
-        # Step 4: inspect provided references for trusted domains (no keyword scanning)
-        refs = c.get("references") or []
-        trusted_flag = False
-        for r in refs:
-            link = r.get("link") or r.get("claim_url") or r.get("url") or ""
-            if _is_trusted_link(link):
-                trusted_flag = True
-                break
-        if trusted_flag:
-            # If there are trusted refs but no explicit verdict, be slightly conservative and set 1.0
-            # (We treat trusted sources as supportive unless fact-check explicitly contradicted)
-            corrected = 1.0
-            c["misp_confidence"] = corrected
-            corrected_scores.append(corrected)
-            continue
-
-        # Step 5: fallback to 0.5 (undecided)
-        c["misp_confidence"] = 0.5
-        corrected_scores.append(0.5)
-
-    # compute overall
     overall: Optional[float] = None
     if corrected_scores:
         overall = sum(corrected_scores) / len(corrected_scores)
@@ -616,7 +784,7 @@ def analyze_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
 
 
 # -----------------
-# Main analyze_content (preserve behavior, uses new normalization)
+# Main analyze_content (uses verify_claim_pipeline)
 # -----------------
 def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, source_url: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -690,26 +858,28 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
         if url:
             default_page_hits.append({"title": p.get("page_title") or url, "link": url, "snippet": ""})
 
-    # If deterministic claims found -> verify them and attach references
+    # If deterministic claims found -> verify them (new sequence)
     if deterministic_claims:
         parsed = {"claims": deterministic_claims, "overall_misp_confidence": None, "top_reasons": []}
-        for c in parsed["claims"]:
-            ctext = c.get("text", "")
-            conf, hits = _verify_claim_with_search(ctext, num=5)
-            if (not hits) and default_page_hits:
-                hits = default_page_hits
-            c["misp_confidence"] = float(max(0.0, min(1.0, conf)))
-            c["references"] = _prioritize_sources(hits) if hits else []
+        for i, c in enumerate(parsed["claims"]):
+            try:
+                updated = verify_claim_pipeline(c)
+            except Exception as e:
+                logger.debug(f"deterministic verify_claim_pipeline failure: {e}")
+                updated = c
+            if (not updated.get("references")) and default_page_hits:
+                updated["references"] = default_page_hits
+            parsed["claims"][i] = updated
         try:
             scores = [float(c.get("misp_confidence", 0.5)) for c in parsed["claims"] if isinstance(c, dict)]
             parsed["overall_misp_confidence"] = (sum(scores) / max(1, len(scores))) if scores else None
-            parsed["top_reasons"] = ["Claims derived from vision signals and checked against web/fact-check results."]
+            parsed["top_reasons"] = ["Claims derived from vision signals were checked via Vertex (+fact-check/support if needed)."]
             explanation_str = json.dumps(parsed, indent=2)
             debug["deterministic"] = True
         except Exception:
             parsed["overall_misp_confidence"] = None
 
-    # 2) If no deterministic claims, call Vertex once (strict prompt)
+    # 2) If no deterministic claims, call Vertex once (strict prompt) -> then verify each claim using sequence
     if not parsed:
         strict_prompt = (
             "You are a strict factual-evidence assistant used inside an automated pipeline. "
@@ -733,21 +903,9 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
             "MANDATORY RULES (must follow):\n"
             "1) IDENTIFY ONLY factual claims that are directly supported by the INPUT (OCR text, image labels, web-entities, or Source URL). DO NOT INVENT claims.\n"
             "2) For each claim set `verdict` to exactly one of: true, false, mixed, undecided.\n"
-            "   - true = claim is supported by authoritative evidence (scientific bodies, official docs, established journalism).\n"
-            "   - false = claim is contradicted by authoritative fact-check(s) or authoritative sources.\n"
-            "   - mixed = claim contains both true and false parts, or true only under limited context.\n"
-            "   - undecided = no reliable evidence either way.\n"
-            "3) `misp_confidence` MUST be consistent with `verdict` using this default mapping (unless you include a clear exception in short_reason):\n"
-            "   - false -> 0.0\n"
-            "   - true -> 1.0\n"
-            "   - mixed -> 0.5\n"
-            "   - undecided -> 0.5\n"
-            "   If you deviate, put the numeric you choose and EXPLAIN the reason briefly in `short_reason` and cite evidence.\n"
-            "4) Populate `evidence` entries with any publisher/title/link/snippet you found from the inputs or web lookups. Mark `authoritative=true` for known fact-checkers, government, or scientific organizations.\n"
-            "5) If you locate a fact-check that explicitly labels the claim FALSE, you MUST set verdict=false and misp_confidence=0.0 and include that fact-check as evidence with `authoritative=true`.\n"
-            "6) Use only the exact verdict keywords (true|false|mixed|undecided). Do NOT use synonyms like 'probably' or 'likely' as the verdict.\n"
-            "7) If no claims can be extracted, return `claims: []` and `overall_misp_confidence: 0.5`.\n"
-            "8) Keep `top_reasons` to 1-3 concise bullets summarizing the strongest signals.\n\n"
+            "3) `misp_confidence` MUST be consistent with `verdict` using mapping (false->0.0,true->1.0,mixed/undecided->0.5).\n"
+            "4) Populate `evidence` entries. Mark `authoritative=true` for known fact-checkers or scientific organizations.\n"
+            "5) If no claims can be extracted, return `claims: []` and `overall_misp_confidence: 0.5`.\n\n"
 
             "INPUT (use these when extracting claims):\n"
             f"Input OCR text:\n{ocr_text}\n\n"
@@ -755,14 +913,7 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
             f"Web entities: {', '.join(web_entities) if web_entities else '(none)'}\n\n"
             f"Source URL: {source_url_for_search if source_url_for_search else '(none)'}\n\n"
 
-            "EXAMPLE (for clarity only — DO NOT output this example; follow schema above):\n"
-            '{ "claims":[ { "text":"The Sun will start rising from the west tomorrow.", "verdict":"false", "misp_confidence":0.0, '
-            '"short_reason":"Contradicted by authoritative astronomy sources (NASA/astronomy fact-check).", '
-            '"evidence":[{"title":"NASA: Earth rotation FAQ","link":"https://www.nasa.gov/...","publisher":"NASA","snippet":"Earth rotates eastward...", "authoritative":true}] } ], '
-            '"overall_misp_confidence":0.0, "top_reasons":["Contradicted by authoritative astronomy sources."] }\n\n'
-
-            "IMPORTANT: JSON ONLY. No commentary, no extra keys outside the schema, and ensure `verdict` + `misp_confidence` agree. "
-            "If you include an exception to the verdict->confidence mapping, justify it in `short_reason` and include concrete evidence entries in `evidence`."
+            "IMPORTANT: JSON ONLY. No commentary, no extra keys outside the schema."
         )
 
         if vertex_available:
@@ -793,49 +944,18 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
                 parsed_candidate = _vertex_parse_structured(raw_text)
                 explanation_str = raw_text
                 if parsed_candidate and parsed_candidate.get("claims"):
-                    # PRESERVE model-provided verdicts/confidences when present.
+                    normalized_claims = []
                     for c in parsed_candidate.get("claims", []):
-                        ctext = c.get("text", "") or ""
-
-                        # detect model-provided numeric confidence if present
-                        model_provided_conf = None
+                        claim_dict = dict(c) if isinstance(c, dict) else {"text": str(c)}
+                        if claim_dict.get("evidence") and not claim_dict.get("references"):
+                            claim_dict["references"] = claim_dict.get("evidence")
                         try:
-                            if isinstance(c.get("misp_confidence"), (int, float, str)):
-                                model_provided_conf = float(c.get("misp_confidence"))
-                        except Exception:
-                            model_provided_conf = None
-
-                        model_provided_verdict = None
-                        try:
-                            if isinstance(c.get("verdict"), str) and c.get("verdict").strip() != "":
-                                model_provided_verdict = str(c.get("verdict")).lower().strip()
-                        except Exception:
-                            model_provided_verdict = None
-
-                        # Attach references if model did not provide them
-                        if not c.get("references"):
-                            conf, hits = _verify_claim_with_search(ctext, num=5)
-                            c["references"] = _prioritize_sources(hits) if hits else []
-                            # only set misp_confidence from search IF the model did NOT provide any verdict/confidence
-                            if model_provided_conf is None and not model_provided_verdict:
-                                c["misp_confidence"] = float(max(0.0, min(1.0, conf)))
-                        else:
-                            # references already present from model; still compute a fallback numeric if model provided nothing
-                            if model_provided_conf is None and not model_provided_verdict:
-                                conf, _ = _verify_claim_with_search(ctext, num=5)
-                                c["misp_confidence"] = float(max(0.0, min(1.0, conf)))
-
-                        # If the model provided a verdict but not a numeric, map it deterministically
-                        if model_provided_verdict and not isinstance(c.get("misp_confidence"), (int, float)):
-                            v = model_provided_verdict
-                            if v == "true":
-                                c["misp_confidence"] = 1.0
-                            elif v == "false":
-                                c["misp_confidence"] = 0.0
-                            elif v in ("mixed", "undecided"):
-                                c["misp_confidence"] = 0.5
-
-                    parsed = parsed_candidate
+                            verified = verify_claim_pipeline(claim_dict)
+                        except Exception as e:
+                            logger.debug(f"verify_claim_pipeline failed on model claim: {e}")
+                            verified = claim_dict
+                        normalized_claims.append(verified)
+                    parsed = {"claims": normalized_claims, "overall_misp_confidence": None, "top_reasons": parsed_candidate.get("top_reasons", [])}
             except Exception as e:
                 debug["vertex_error"] = str(e)
                 logger.warning(f"Vertex call failed: {e}")
@@ -847,25 +967,26 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
     # --- DIRECT fallback on the text if still nothing parsed
     if not parsed and text and text.strip():
         try:
-            conf, hits = _verify_claim_with_search(text.strip(), num=5)
+            claim_obj = {"text": text.strip()}
+            verified = verify_claim_pipeline(claim_obj)
             parsed = {
                 "claims": [
                     {
-                        "text": text.strip(),
-                        "misp_confidence": float(conf),
-                        "short_reason": "Direct fact-check/custom-search results used.",
-                        "references": hits or []
+                        "text": verified.get("text", text.strip()),
+                        "misp_confidence": float(verified.get("misp_confidence", 0.5)),
+                        "short_reason": "Direct Vertex/fact-check/support pipeline result.",
+                        "references": verified.get("references", [])
                     }
                 ],
-                "overall_misp_confidence": float(conf),
-                "top_reasons": ["Direct fact-check / web search used due to empty model output."]
+                "overall_misp_confidence": float(verified.get("misp_confidence", 0.5)),
+                "top_reasons": ["Direct Vertex/fact-check/support pipeline used due to empty model output."]
             }
             explanation_str = json.dumps(parsed, indent=2)
             debug["direct_factcheck"] = True
         except Exception as e:
             logger.debug(f"Direct fact-check fallback failed: {e}")
 
-    # Normalize parsed confidences using the new keyword-free approach
+    # Normalize parsed confidences
     corrected_overall: Optional[float] = None
     if parsed:
         try:
@@ -1077,7 +1198,8 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
         "user_explanation": user_explanation,
         "top_sources": norm_top_links,
         "parsed": parsed or {"claims": [], "overall_misp_confidence": None},
-        "debug": debug
+        "debug": debug,
+        "misp_confidence": float(misp_conf)  # top-level numeric 0..1
     }
 
     return result
