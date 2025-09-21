@@ -7,7 +7,7 @@ import math
 from typing import Dict, Any, Optional, List, Tuple, Sequence, cast
 from urllib.parse import urlparse
 from datetime import datetime
- 
+
 from google.oauth2 import service_account
 from dotenv import load_dotenv
 
