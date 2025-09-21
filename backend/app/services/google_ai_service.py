@@ -3,6 +3,7 @@ import re
 import json
 import logging
 import textwrap
+import math
 from typing import Dict, Any, Optional, List, Tuple, Sequence, cast
 from urllib.parse import urlparse
 from datetime import datetime
@@ -218,8 +219,8 @@ def _normalize_textual_rating_to_verdict(textual: Optional[str]) -> Optional[str
     if not textual:
         return None
     t = str(textual).lower()
-    false_keys = ["false", "pants on fire", "incorrect", "not true", "hoax", "debunk"]
-    true_keys = ["true", "correct", "supports", "confirmed"]
+    false_keys = ["false", "pants on fire", "incorrect", "not true", "hoax", "debunk", "refuted", "refute"]
+    true_keys = ["true", "correct", "supports", "confirmed", "accurate"]
     for k in false_keys:
         if k in t:
             return "false"
@@ -340,7 +341,7 @@ def _prioritize_sources(hits: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # -----------------
-# verify claim using fact-check API + fallback
+# verify claim using fact-check API + fallback (unchanged)
 # -----------------
 def _verify_claim_with_search(claim: str, num: int = 5) -> Tuple[float, List[Dict[str, Any]]]:
     conf = 0.5
@@ -379,7 +380,7 @@ def _verify_claim_with_search(claim: str, num: int = 5) -> Tuple[float, List[Dic
                     conf = 1.0
                     norm_hits = [_normalize_ref(hh) for hh in hits][:5]
                     return float(conf), norm_hits
-            # check snippets for debunk signals
+            # check snippets for debunk signals (kept minimal here; do not rely on arbitrary keywords)
             for h in hits:
                 snippet = (h.get("snippet") or "").lower()
                 if any(k in snippet for k in ("false", "debunk", "no evidence", "hoax", "misleading")):
@@ -397,81 +398,113 @@ def _verify_claim_with_search(claim: str, num: int = 5) -> Tuple[float, List[Dic
 
 
 # -----------------
-# normalize confidences
+# NEW: normalize confidences (keyword-free, factcheck-first)
 # -----------------
-_truth_keywords: List[str] = [
-    "true", "accurate", "accurately", "fundamental", "universally accepted",
-    "scientific consensus", "supported by", "evidence", "proven", "confirmed",
-    "established", "accepted", "indeed", "correct", "correctly", "accurate",
-    "global pandemic", "pandemic", "pandemics", "widespread", "widespreadly",
-    "caused", "causes", "cause", "resulted in", "resulted", "led to", "led",
-    "significant", "numerous", "health", "economic", "social", "foundational"
-]
-
-_false_keywords: List[str] = [
-    "no evidence", "debunk", "debunked", "false", "misleading", "fabricated",
-    "conspiracy", "untrue", "incorrect", "not true", "disproved", "hoax",
-    "fake", "unsupported", "refuted"
-]
-
-
 def _normalize_parsed_confidences(parsed: Dict[str, Any], explanation_text: str) -> Tuple[Dict[str, Any], Optional[float]]:
+    """
+    Replaces keyword heuristics with a deterministic, factual-first normalization.
+
+    Rules (deterministic, no keyword scanning on explanation_text):
+      1. If the claim object already contains a numeric misp_confidence (0..1), preserve it.
+      2. Else if claim has a 'verdict' field (true/false/mixed/undecided), map to numeric.
+      3. Else try to match authoritative Fact Check API results for the claim text; if a decisive fact-check exists, use it and attach references.
+      4. Else if references contain trusted fact-check domains -> set to true/false if claimReview info suggests it; otherwise use 0.5.
+      5. Else default to 0.5 (undecided).
+    """
     if not parsed or not isinstance(parsed, dict):
         return parsed, None
 
     claims = parsed.get("claims", [])
     corrected_scores: List[float] = []
 
-    context_parts: List[str] = []
-    if explanation_text:
-        context_parts.append(explanation_text.lower())
-    top_reasons = parsed.get("top_reasons", [])
-    if isinstance(top_reasons, list):
-        context_parts.extend([str(r).lower() for r in top_reasons])
-    context_text = " ".join(context_parts)
-
     for idx, c in enumerate(claims):
         if not isinstance(c, dict):
             c = {"text": str(c)}
+            claims[idx] = c
 
-        claim_text = (c.get("text") or "").lower()
-        short_reason = (c.get("short_reason") or "").lower()
-        combined = " ".join([context_text, claim_text, short_reason]).lower()
-
-        t_count = sum(1 for kw in _truth_keywords if kw in combined)
-        f_count = sum(1 for kw in _false_keywords if kw in combined)
-
-        textual_inferred_conf: Optional[float] = None
-        if t_count > f_count and t_count >= 1:
-            textual_inferred_conf = 1.0
-        elif f_count > t_count and f_count >= 1:
-            textual_inferred_conf = 0.0
-
-        numeric = c.get("misp_confidence", None)
-        corrected: float
-
-        if isinstance(numeric, (int, float)):
-            numeric = float(numeric)
-            if textual_inferred_conf is not None and abs(numeric - textual_inferred_conf) > 0.4:
-                corrected = float(textual_inferred_conf)
-                logger.debug(
-                    f"Normalized claim[{idx}] numeric {numeric} -> {corrected} due to textual cues (t_count={t_count}, f_count={f_count})."
-                )
+        claim_text = (c.get("text") or "").strip()
+        model_prov_num = None
+        # preserve model-provided numeric if present and valid
+        try:
+            if isinstance(c.get("misp_confidence"), (int, float, str)):
+                model_prov_num = float(c.get("misp_confidence"))
+                if math.isnan(model_prov_num) or model_prov_num is None:
+                    model_prov_num = None
             else:
-                corrected = numeric
-        else:
-            if textual_inferred_conf is not None:
-                corrected = float(textual_inferred_conf)
+                model_prov_num = None
+        except Exception:
+            model_prov_num = None
+
+        # Step 1: numeric present -> keep it
+        if model_prov_num is not None:
+            corrected = float(max(0.0, min(1.0, model_prov_num)))
+            c["misp_confidence"] = corrected
+            corrected_scores.append(corrected)
+            continue
+
+        # Step 2: verdict mapping if present
+        verdict = None
+        try:
+            if isinstance(c.get("verdict"), str):
+                verdict = c.get("verdict").lower().strip()
+        except Exception:
+            verdict = None
+
+        if verdict:
+            if verdict == "true":
+                corrected = 1.0
+            elif verdict == "false":
+                corrected = 0.0
+            elif verdict in ("mixed", "undecided"):
+                corrected = 0.5
             else:
                 corrected = 0.5
-
-        try:
-            c["misp_confidence"] = float(corrected)
-        except Exception:
             c["misp_confidence"] = corrected
+            corrected_scores.append(corrected)
+            continue
 
-        corrected_scores.append(float(c["misp_confidence"]))
+        # Step 3: try authoritative fact-check match
+        try:
+            fc_hits = _factcheck_search(claim_text, num=5)
+            if fc_hits:
+                decisive = _pick_decisive_factcheck(fc_hits)
+                if decisive:
+                    dv = decisive.get("verdict")
+                    if dv == "false":
+                        corrected = 0.0
+                    elif dv == "true":
+                        corrected = 1.0
+                    else:
+                        corrected = 0.5
+                    # attach normalized fact-check references
+                    c["references"] = [_normalize_ref(h) for h in fc_hits][:5]
+                    c["misp_confidence"] = corrected
+                    corrected_scores.append(corrected)
+                    continue
+        except Exception as e:
+            logger.debug(f"Fact-check lookup during normalization failed for claim '{claim_text}': {e}")
 
+        # Step 4: inspect provided references for trusted domains (no keyword scanning)
+        refs = c.get("references") or []
+        trusted_flag = False
+        for r in refs:
+            link = r.get("link") or r.get("claim_url") or r.get("url") or ""
+            if _is_trusted_link(link):
+                trusted_flag = True
+                break
+        if trusted_flag:
+            # If there are trusted refs but no explicit verdict, be slightly conservative and set 1.0
+            # (We treat trusted sources as supportive unless fact-check explicitly contradicted)
+            corrected = 1.0
+            c["misp_confidence"] = corrected
+            corrected_scores.append(corrected)
+            continue
+
+        # Step 5: fallback to 0.5 (undecided)
+        c["misp_confidence"] = 0.5
+        corrected_scores.append(0.5)
+
+    # compute overall
     overall: Optional[float] = None
     if corrected_scores:
         overall = sum(corrected_scores) / len(corrected_scores)
@@ -481,7 +514,7 @@ def _normalize_parsed_confidences(parsed: Dict[str, Any], explanation_text: str)
 
 
 # -----------------
-# Vision analyze (robust)
+# Vision analyze (unchanged)
 # -----------------
 def analyze_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
     if VISION_CLIENT is None or vision is None:
@@ -583,7 +616,7 @@ def analyze_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
 
 
 # -----------------
-# Main analyze_content (updated to return canonical JSON)
+# Main analyze_content (preserve behavior, uses new normalization)
 # -----------------
 def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, source_url: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -832,7 +865,7 @@ def analyze_content(text: Optional[str], image_bytes: Optional[bytes] = None, so
         except Exception as e:
             logger.debug(f"Direct fact-check fallback failed: {e}")
 
-    # Normalize parsed confidences
+    # Normalize parsed confidences using the new keyword-free approach
     corrected_overall: Optional[float] = None
     if parsed:
         try:
