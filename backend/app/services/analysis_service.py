@@ -75,4 +75,4 @@ def compute_misinfo_score(
     if not reasons:
         reasons.append("No strong signals for misinformation detected; content appears credible.")
 
-    return {"score": score_0_10, "color": color, "top_reasons": reasons}
+    return {"score": score_0_10, "color": color, "top_reasons ": reasons}
