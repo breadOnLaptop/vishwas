@@ -1,35 +1,46 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import React, { useState } from "react";
+import Header from "./components/Header";
+import InputForm from "./components/InputForm";
+import AnalysisResult from "./components/AnalysisResult";
+import Loader from "./components/Loader";
+import "./index.css";
+import api from "./api";
 
-function App() {
-  const [count, setCount] = useState(0)
+export default function App() {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [bgClass, setBgClass] = useState("");
+
+  const handleAnalysis = async (formData, type = "text") => {
+    setLoading(true);
+    setResult(null);
+    try {
+      const res = type === "image" ? await api.analyzeImage(formData) : await api.analyzeText(formData);
+      setResult(res);
+
+      // small themed background hint (keeps original behavior)
+      const color = res?.color;
+      if (color === "red") setBgClass("red-bg");
+      else if (color === "orange") setBgClass("orange-bg");
+      else if (color === "green") setBgClass("green-bg");
+      else setBgClass("");
+    } catch (err) {
+      console.error("analysis error", err);
+      setResult({ user_explanation: "Error querying server: " + (err.message || err) });
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.jsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
+    <div className={`app-container ${bgClass}`} role="application">
+      <Header />
+      <main style={{ width: "100%", display: "flex", justifyContent: "center" }}>
+        <div style={{ width: "100%", maxWidth: 1000 }}>
+          <InputForm onAnalyze={handleAnalysis} />
+          {loading ? <Loader /> : result && <AnalysisResult result={result} />}
+        </div>
+      </main>
+    </div>
+  );
 }
-
-export default App
