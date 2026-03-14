@@ -62,16 +62,24 @@ class GCPProvider:
             # DEEP DIAGNOSTIC
             cx = os.getenv("GOOGLE_SEARCH_CX")
             key = os.getenv("GOOGLE_SEARCH_API_KEY")
-            logger.info(f"[{self.req_id}] DIAGNOSTIC: Key={key[:5]}... CX={cx[:5]}...")
-            
-            test_url = f"https://www.googleapis.com/customsearch/v1?q=test&cx={cx}&key={key}"
-            logger.info(f"[{self.req_id}] TEST URL (Paste in browser): {test_url}")
-            
-            test_res = self._query_custom_search("Google")
-            if test_res:
-                logger.info(f"[{self.req_id}] RAG STATUS: ONLINE (Found {len(test_res)} items)")
+
+            if not cx or not key:
+                logger.warning(f"[{self.req_id}] RAG STATUS: WARNING. GOOGLE_SEARCH_CX or GOOGLE_SEARCH_API_KEY missing from .env")
+                logger.info(f"[{self.req_id}] CX Present: {bool(cx)}, Key Present: {bool(key)}")
             else:
-                logger.error(f"[{self.req_id}] RAG STATUS: ERROR (0 results. Your CX ID might be wrong or 'Search entire web' is not propagating)")
+                logger.info(f"[{self.req_id}] DIAGNOSTIC: Key={key[:5]}... CX={cx[:5]}...")
+                test_url = f"https://www.googleapis.com/customsearch/v1?q=test&cx={cx}&key={key}"
+                logger.info(f"[{self.req_id}] TEST URL (Paste in browser): {test_url}")
+            
+            # Always try to query if keys exist, or if we have at least one valid key
+            if cx and key:
+                test_res = self._query_custom_search("Google")
+                if test_res:
+                    logger.info(f"[{self.req_id}] RAG STATUS: ONLINE (Found {len(test_res)} items)")
+                else:
+                    logger.error(f"[{self.req_id}] RAG STATUS: ERROR (0 results. Check CX ID or API settings)")
+            else:
+                logger.error(f"[{self.req_id}] RAG STATUS: OFFLINE (Missing credentials)")
                 
         except Exception as e:
             logger.error(f"[{self.req_id}] RAG STATUS: CRITICAL ERROR: {e}")
@@ -83,7 +91,7 @@ class GCPProvider:
         
         search_queries = []
         try:
-            kw_prompt = f"Identify 2 factual queries to fact-check this: {extracted_text[:500]}. Return JSON list."
+            kw_prompt = f"Identify 3-4 distinct factual search queries to verify this content: {extracted_text[:600]}. Return ONLY a JSON list of strings."
             kw_resp = self.vertex_model.generate_content(kw_prompt)
             search_queries = json.loads(self._clean_json(kw_resp.text))
         except:
@@ -92,14 +100,18 @@ class GCPProvider:
         all_fact_checks = []
         all_web_links = []
         
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             fact_f = [executor.submit(self._query_fact_check, q) for q in search_queries]
             web_f = [executor.submit(self._query_custom_search, q) for q in search_queries]
             for f in fact_f: all_fact_checks.extend(f.result())
             for w in web_f: all_web_links.extend(w.result())
 
-        unique_facts = list({f['claim_text']: f for f in all_fact_checks}.values())
+        # Improved deduplication and ranking
+        unique_facts = list({f['claim_text'].lower(): f for f in all_fact_checks}.values())
         unique_web = list({w['link']: w for w in all_web_links}.values())
+        
+        # Sort web evidence by source quality/relevance (simple heuristic: snippets with more keywords)
+        unique_web.sort(key=lambda x: len(x.get('snippet', '')), reverse=True)
         
         context = f"CONTENT: {extracted_text}\n\nEVIDENCE: {json.dumps(unique_facts)} {json.dumps(unique_web)}"
         
@@ -107,8 +119,11 @@ class GCPProvider:
             vertex_resp = self.vertex_model.generate_content(prompts.get_analysis_prompt(context))
             data = json.loads(self._clean_json(vertex_resp.text))
             data["fact_checks"] = unique_facts[:5]
-            data["web_evidence"] = unique_web[:5]
-            data["evidence_weight"] = min(10.0, (len(unique_facts) * 4.0) + (len(unique_web) * 1.5))
+            data["web_evidence"] = unique_web[:8] # Show up to 8 web links
+            
+            # More nuanced evidence weight: Fact checks carry 3x more weight than general web links
+            raw_weight = (len(unique_facts) * 3.0) + (len(unique_web) * 0.8)
+            data["evidence_weight"] = min(10.0, raw_weight)
             return data
         except Exception as e:
             logger.error(f"[{self.req_id}] SYNTHESIS ERROR: {e}")
