@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package v1;
+
+option go_package = "github.com/vishwas/api-contracts/v1;v1";
+
+import "v1/intelligence.proto";
+import "v1/knowledge.proto";
+
+// OrchestrationService is the public gateway
+service OrchestrationService {
+  rpc AnalyzeContent (AnalyzeRequest) returns (AnalyzeResponse);
+}
+// Using AnalyzeRequest/Response from intelligence.proto or redefining if needed.

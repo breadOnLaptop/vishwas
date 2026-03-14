@@ -1,0 +1,8 @@
+grpcio
+grpcio-tools
+google-cloud-aiplatform
+google-cloud-vision
+google-api-python-client
+python-dotenv
+PyPDF2
+python-docx

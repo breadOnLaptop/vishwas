@@ -1,15 +1,26 @@
-# virtual env
-backend/.venv
+# OS
+.DS_Store
+Thumbs.db
 
-# caches
-.mypy_cache
-__pycache__
+# Environments & Secrets
+.env
+*.env
+google-credentials.json
+.venv/
+venv/
+__pycache__/
+*.pyc
 
-# Ignore Google Cloud credentials
-backend/google-credentials.json
-backend/.env
+# Go
+backend/internal/gen/
+go.sum
 
-# frontend
-frontend/node_modules/
-frontend/package-lock.json
-frontend/dist
+# Node / Frontend
+node_modules/
+dist/
+build/
+.eslintcache
+
+# Protos (Generated)
+intelligence/proto/*_pb2.py
+intelligence/proto/*_pb2_grpc.py

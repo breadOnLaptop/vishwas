@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package v1;
+
+option go_package = "github.com/vishwas/api-contracts/v1;v1";
+
+service IntelligenceService {
+  rpc AnalyzeContent (AnalyzeRequest) returns (AnalyzeResponse);
+}
+
+message AnalyzeRequest {
+  string text = 1;
+  bytes image_bytes = 2;
+  string source_url = 3;
+  string filename = 4;
+}
+
+message AnalyzeResponse {
+  float score = 1;
+  string color = 2;
+  repeated string top_reasons = 3;
+  string user_explanation = 4;
+  string explanation = 5;
+  ParsedOut parsed = 6;
+  VisionResult vision = 7;
+  repeated ClaimReference top_sources = 8;
+  string debug_logs = 9;
+  
+  // RAG Pipeline Extensions
+  repeated FactCheckMatch fact_checks = 10;
+  repeated WebEvidence web_evidence = 11;
+  float evidence_weight = 12; // 0.0 to 10.0 indicating how much evidence exists
+}
+
+message VisionResult {
+  string text = 1;
+  repeated string labels = 2;
+  float safe_search_score = 3;
+}
+
+message ParsedOut {
+  float overall_misp_confidence = 1;
+  repeated Claim claims = 2;
+}
+
+message Claim {
+  string text = 1;
+  float misp_confidence = 2; // 0 to 1
+  float confidence_score = 3; // 0 to 10 (for UI)
+  string short_reason = 4;
+  repeated ClaimReference references = 5;
+}
+
+message ClaimReference {
+  string title = 1;
+  string link = 2;
+  string snippet = 3;
+  string publisher = 4;
+}
+
+message FactCheckMatch {
+  string claimant = 1;
+  string claim_date = 2;
+  string claim_text = 3;
+  string reviewer = 4;
+  string review_date = 5;
+  string textual_rating = 6;
+  string title = 7;
+  string url = 8;
+}
+
+message WebEvidence {
+  string title = 1;
+  string link = 2;
+  string snippet = 3;
+  string source = 4;
+}

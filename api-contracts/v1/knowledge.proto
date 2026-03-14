@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package v1;
+
+option go_package = "github.com/vishwas/api-contracts/v1;v1";
+
+import "v1/intelligence.proto";
+
+// KnowledgeService manages the vector database (Stateful)
+service KnowledgeService {
+  rpc IngestChunks (IngestRequest) returns (IngestResponse);
+  rpc SearchSimilar (SearchRequest) returns (SearchResponse);
+}
+
+message IngestRequest {
+  repeated Chunk chunks = 1;
+}
+
+message IngestResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SearchRequest {
+  repeated float query_vector = 1;
+  int32 top_k = 2;
+}
+
+message SearchResponse {
+  repeated Chunk results = 1;
+}
+
+message Chunk {
+  string text_content = 1;
+  repeated float vector = 2;
+  string source_id = 3;
+  int32 page_number = 4;
+}
